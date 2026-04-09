@@ -115,22 +115,16 @@ while True:
         keyboard.press(Keycode.DOWN_ARROW)
         keyboard.release_all()
 
-    elif type_param == "dragdown":
+    elif type_param == "dragdown" or type_param == "dragup":
+        step = 25 if type_param == "dragdown" else -25
         mouse.move(x=-1000, y=-1000)
         time.sleep(0.1)
-        mouse.move(x=x_param, y=y_param)
+        move_in_chunks(x_param, y_param)
         time.sleep(0.1)
         mouse.press(Mouse.LEFT_BUTTON)
-        time.sleep(0.05)
-        mouse.move(y=25)
-        time.sleep(0.05)
-        mouse.move(y=25)
-        time.sleep(0.05)
-        mouse.move(y=25)
-        time.sleep(0.05)
-        mouse.move(y=25)
-        time.sleep(0.05)
-        mouse.move(y=25)
+        for _ in range(5):
+            time.sleep(0.05)
+            mouse.move(y=step)
         mouse.release(Mouse.LEFT_BUTTON)
 
     uart.write("Success\n".encode("utf-8"))

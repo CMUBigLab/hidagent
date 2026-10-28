@@ -314,7 +314,7 @@ def type_text(text):
         text: The string to type.
     """
     cmd = json.dumps({"type": "type", "text": text})
-    send_serial_message(f"{cmd}\n", wait_response=False)
+    send_serial_message(f"{cmd}\n")
 
 
 def keypress(keys):
@@ -330,7 +330,7 @@ def keypress(keys):
     # Join keys with "+" for the HID bridge to parse
     key_str = "+".join(keys)
     cmd = json.dumps({"type": "key", "text": key_str})
-    send_serial_message(f"{cmd}\n", wait_response=False)
+    send_serial_message(f"{cmd}\n")
 
 
 def run_application(application_name):
@@ -344,7 +344,7 @@ def run_application(application_name):
             (e.g., "Safari", "Notes", "Chrome").
     """
     cmd = json.dumps({"type": "run", "text": application_name})
-    send_serial_message(f"{cmd}\n", wait_response=False)
+    send_serial_message(f"{cmd}\n")
 
 
 def hid_calibration(steps=None, step_size=None):
@@ -922,6 +922,11 @@ def run_tool(tool_name, tool_input):
 _serial_conn = None  # persistent serial connection
 _serial_lock = threading.Lock()
 
+# Upper bound on waiting for the HID bridge's reply. Commands take 2-7 s on
+# the device (long moves are slowest); readline() returns as soon as the
+# reply arrives, so this only matters if the bridge stops responding.
+_SERIAL_RESPONSE_TIMEOUT = 15
+
 
 def _get_serial_conn():
     """Return a persistent serial connection, opening it on first call."""
@@ -935,7 +940,8 @@ def _get_serial_conn():
         raise FileNotFoundError("No /dev/tty.usbserial device found")
     serial_port = serial_devices[0]
 
-    _serial_conn = serial.Serial(port=serial_port, baudrate=9600, timeout=0.5)
+    _serial_conn = serial.Serial(port=serial_port, baudrate=9600,
+                                 timeout=_SERIAL_RESPONSE_TIMEOUT)
     return _serial_conn
 
 
@@ -948,6 +954,14 @@ def release_serial_conn():
 
 
 def send_serial_message(message, wait_response=True):
+    """Send a command to the HID bridge and wait for it to finish.
+
+    The bridge replies "Success" (or "Error") once the command has been
+    carried out on the target device, so waiting keeps actions in order and
+    means a screenshot taken afterwards shows the finished result. Pass
+    wait_response=False only when the caller doesn't care about either;
+    unread replies are discarded before the next command is sent.
+    """
     print(f"Sending message: {message.strip()}")
 
     with _serial_lock:
@@ -961,7 +975,12 @@ def send_serial_message(message, wait_response=True):
 
             if wait_response:
                 response = ser.readline().decode('utf-8').strip()
-                print(f"Received: {response}")
+                if response:
+                    print(f"Received: {response}")
+                else:
+                    print(f"Warning: no reply from HID bridge within "
+                          f"{_SERIAL_RESPONSE_TIMEOUT}s")
+                return response
 
         except KeyboardInterrupt:
             pass

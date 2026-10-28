@@ -107,9 +107,9 @@ def main():
     key_cmd = json.dumps({"type": "key", "text": "escape"}) + "\n"
 
     def serial_cmd():
-        send_serial_message(key_cmd, wait_response=False)
+        send_serial_message(key_cmd)
 
-    results.append(benchmark(serial_cmd, n, 'send_serial_message (key press)'))
+    results.append(benchmark(serial_cmd, n, 'send_serial_message (key press, round trip)'))
 
     # ----------------------------------------------------------------
     # 3. Move mouse to (50, 50)

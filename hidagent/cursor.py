@@ -265,9 +265,26 @@ class CursorPositioner:
             json.dump(data, f)
 
     # ---------------------------------------------------------------- model
+    def _unpinned(self, o):
+        """Drop landings pinned against a screen edge.
+
+        iOS stops the pointer at the edges, so every command past the edge
+        lands on the same line; those landings carry no slope information
+        and would wreck a local fit.
+        """
+        if len(o) < 10:
+            return o
+        keep = np.ones(len(o), bool)
+        for col in (2, 3):
+            lo, hi = o[:, col].min(), o[:, col].max()
+            keep &= (o[:, col] > lo + 1.0) & (o[:, col] < hi - 1.0)
+        return o[keep]
+
     def _fit(self, key, by, k=8, pts=None):
         """Locally weighted affine map from the k observations nearest key."""
         o = np.array(self.obs if pts is None else pts, float)
+        if pts is None:
+            o = self._unpinned(o)
         if len(o) < 3:
             return None
         s, t = ([2, 3], [0, 1]) if by == "pos" else ([0, 1], [2, 3])
@@ -348,17 +365,20 @@ class CursorPositioner:
     def goto(self, tx, ty, tol=1.0, max_iter=8):
         """Steer the cursor onto (tx, ty).
 
-        Returns {"cmd", "pos", "err", "iters", "verified"} for the closest
-        landing (the cursor is left there), or None if the cursor was never
-        found. verified is False when the pointer was invisible at the final
-        spot (e.g. over a black icon) and pos was estimated from the visible
-        landings around it.
+        Returns {"cmd", "pos", "err", "iters", "verified", "snapped"} for the
+        closest landing (the cursor is left there), or None if the cursor
+        was never found. verified is False when the pointer was invisible at
+        the final spot (e.g. over a black icon) and pos was estimated from
+        the visible landings around it. snapped is True when iOS jumps the
+        resting pointer across the target (it snaps onto nearby app icons),
+        so the exact pixel can't be reached; pos is then the closest
+        reachable landing.
         """
         target = np.array([tx, ty], float)
         cmd = np.round(self.predict_cmd(target)).astype(int)
         lo, hi = [None, None], [None, None]  # per-axis bracket on the command
         here, tried = [], {}
-        best, misses, it = None, 0, 0
+        best, misses, stalls, it = None, 0, 0, 0
         while it < max_iter:
             it += 1
             key = (int(cmd[0]), int(cmd[1]))
@@ -374,18 +394,23 @@ class CursorPositioner:
                     continue
                 # The pointer is invisible here, but landings are smooth and
                 # repeatable, so estimate where it went from nearby visible
-                # landings (this target's included) and keep steering.
+                # landings (this target's included) and keep steering --
+                # unless those landings show a snap, which no fit can bridge.
                 pred = self.predict_pos(key)
-                if pred is None or misses > 3:
+                if pred is None or misses > 3 or _has_jump(here):
                     break
                 pos = (float(pred[0]), float(pred[1]))
             else:
                 here.append((*key, *pos))
             err = target - np.array(pos)
             dist = float(np.hypot(*err))
+            if best is None or dist < best["err"] - 0.2:
+                stalls = 0
+            else:
+                stalls += 1
             if best is None or dist < best["err"]:
                 best = {"cmd": key, "pos": pos, "err": dist, "verified": verified}
-            if dist <= tol:
+            if dist <= tol or stalls >= 2:
                 break
             # Landing position increases with the command on each axis, so
             # remember the tightest commands known to land short / long. The
@@ -428,8 +453,24 @@ class CursorPositioner:
             if best["verified"]:
                 self.t.locate(expected=best["pos"], search_radius=15)
         best["iters"] = it
+        best["snapped"] = best["err"] > tol and _has_jump(here)
         self.save()
         return best
+
+
+def _has_jump(landings, max_px_per_unit=4.0):
+    """True if commands a few units apart landed implausibly far apart.
+
+    Normal landings move at most ~2 px per HID unit; a bigger jump between
+    nearby commands means iOS snapped the pointer (e.g. onto an app icon).
+    """
+    o = np.array(landings, float)
+    for i in range(len(o)):
+        for j in range(i + 1, len(o)):
+            dc = np.abs(o[i, :2] - o[j, :2]).max()
+            if 0 < dc <= 3 and np.abs(o[i, 2:] - o[j, 2:]).max() / dc > max_px_per_unit:
+                return True
+    return False
 
 
 _positioner = None

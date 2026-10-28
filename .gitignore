@@ -1,0 +1,18 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Device-specific calibration (regenerated per target device)
+hidagent/calibration.json
+
+# Generated output from examples
+examples/dataset/
+examples/imgs/
+snapshot.jpg

@@ -7,6 +7,7 @@ import sys
 import json
 import time
 import glob
+import threading
 import base64
 from io import BytesIO
 
@@ -313,7 +314,7 @@ def type_text(text):
         text: The string to type.
     """
     cmd = json.dumps({"type": "type", "text": text})
-    send_serial_message(f"{cmd}\n")
+    send_serial_message(f"{cmd}\n", wait_response=False)
 
 
 def keypress(keys):
@@ -329,7 +330,7 @@ def keypress(keys):
     # Join keys with "+" for the HID bridge to parse
     key_str = "+".join(keys)
     cmd = json.dumps({"type": "key", "text": key_str})
-    send_serial_message(f"{cmd}\n")
+    send_serial_message(f"{cmd}\n", wait_response=False)
 
 
 def run_application(application_name):
@@ -343,7 +344,7 @@ def run_application(application_name):
             (e.g., "Safari", "Notes", "Chrome").
     """
     cmd = json.dumps({"type": "run", "text": application_name})
-    send_serial_message(f"{cmd}\n")
+    send_serial_message(f"{cmd}\n", wait_response=False)
 
 
 def hid_calibration(steps=None, step_size=None):
@@ -918,32 +919,52 @@ def run_tool(tool_name, tool_input):
     else:
         return [{"type": "text", "text": f"Error: Unknown tool: {tool_name}"}]
 
-def send_serial_message(message):
-    print(f"Sending message: {message.strip()}")
+_serial_conn = None  # persistent serial connection
+_serial_lock = threading.Lock()
 
-    # Configure serial port (update as needed)
+
+def _get_serial_conn():
+    """Return a persistent serial connection, opening it on first call."""
+    global _serial_conn
+
+    if _serial_conn is not None and _serial_conn.is_open:
+        return _serial_conn
+
     serial_devices = glob.glob('/dev/tty.usbserial*')
     if not serial_devices:
         raise FileNotFoundError("No /dev/tty.usbserial device found")
     serial_port = serial_devices[0]
 
-    ser = serial.Serial(port=serial_port, baudrate=9600, timeout=3)
+    _serial_conn = serial.Serial(port=serial_port, baudrate=9600, timeout=0.5)
+    return _serial_conn
 
-    try:
-        ser.write(message.encode('utf-8'))
-        print(f"Sent: {message.strip()}")
-        time.sleep(1)
 
-        response = ser.readline().decode('utf-8').strip()
-        print(f"Received: {response}")
-        if(response == "Success"):
-            print("success!!")
-        time.sleep(1)
+def release_serial_conn():
+    """Release the persistent serial connection (call on shutdown)."""
+    global _serial_conn
+    if _serial_conn is not None:
+        _serial_conn.close()
+        _serial_conn = None
 
-    except KeyboardInterrupt:
-        pass
-    finally:
-        ser.close()
+
+def send_serial_message(message, wait_response=True):
+    print(f"Sending message: {message.strip()}")
+
+    with _serial_lock:
+        ser = _get_serial_conn()
+
+        try:
+            ser.reset_input_buffer()
+            ser.write(message.encode('utf-8'))
+            ser.flush()
+            print(f"Sent: {message.strip()}")
+
+            if wait_response:
+                response = ser.readline().decode('utf-8').strip()
+                print(f"Received: {response}")
+
+        except KeyboardInterrupt:
+            pass
 
 
 def convert_to_html(image, omni_parser):
@@ -1145,24 +1166,28 @@ def list_cameras():
 
     return camera_num
 
-def get_image_from_usb():
-    #camera_num = list_cameras()
-    #print(f"Using camera {camera_num}")
+_usb_capture = None   # persistent VideoCapture handle
+_usb_camera_name = None
 
-    # Warm up camera system first to ensure USB cameras are detected
-    #print("Initializing camera system...")
-    #for i in range(5):  # Try multiple camera indices to wake up the system
-    #    test_cap = cv2.VideoCapture(i)
-    #    if test_cap.isOpened():
-    #        test_cap.read()  # Just read a frame to initialize
-    #        test_cap.release()
-    #    time.sleep(0.2)  # Small delay between attempts
+
+def _get_usb_capture():
+    """Return a persistent VideoCapture for the USB capture device.
+
+    Opens the device and warms it up on first call; subsequent calls
+    reuse the same handle so each frame grab is a single read (~33 ms
+    at 30 fps) instead of re-opening and discarding 10 warm-up frames.
+    """
+    global _usb_capture, _usb_camera_name
+
+    if _usb_capture is not None and _usb_capture.isOpened():
+        return _usb_capture
 
     # Find cameras using the legacy method to avoid Continuity Camera warnings
-    devices = AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeVideo)
+    devices = AVFoundation.AVCaptureDevice.devicesWithMediaType_(
+        AVFoundation.AVMediaTypeVideo)
     camera_num = 0
     usb_camera_found = False
-    selected_name = None
+    _usb_camera_name = None
 
     for idx, device in enumerate(devices):
         device_name = device.localizedName()
@@ -1171,7 +1196,7 @@ def get_image_from_usb():
         if "USB" in device_name and not usb_camera_found:
             camera_num = idx
             usb_camera_found = True
-            selected_name = device_name
+            _usb_camera_name = device_name
             break
 
     if not usb_camera_found:
@@ -1179,23 +1204,42 @@ def get_image_from_usb():
             device_name = device.localizedName()
             if "Continuity" not in device_name:
                 camera_num = idx
-                selected_name = device_name
+                _usb_camera_name = device_name
                 break
-    
+
     camera_num = 0
 
     cap = cv2.VideoCapture(camera_num)
     if not cap.isOpened():
         raise ValueError('Webcam not found or cannot be opened')
 
-    # Warm up the camera
+    # Warm up the camera (only needed once)
     for _ in range(10):
         cap.read()
 
+    _usb_capture = cap
+    return _usb_capture
+
+
+def release_usb_capture():
+    """Release the persistent USB capture device (call on shutdown)."""
+    global _usb_capture
+    if _usb_capture is not None:
+        _usb_capture.release()
+        _usb_capture = None
+
+
+def get_image_from_usb():
+    cap = _get_usb_capture()
+
     ret, frame = cap.read()
-    cap.release()
     if not ret:
-        raise ValueError('Failed to capture image from webcam')
+        # Device may have been disconnected — reset and retry once
+        release_usb_capture()
+        cap = _get_usb_capture()
+        ret, frame = cap.read()
+        if not ret:
+            raise ValueError('Failed to capture image from webcam')
 
     # Convert the image from OpenCV BGR format to RGB
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1223,7 +1267,7 @@ def get_image_from_usb():
     # Convert to PIL Image
     image = Image.fromarray(frame_rgb)
 
-    print(f"Captured {image.size[0]}x{image.size[1]} from {selected_name or 'camera ' + str(camera_num)}")
+    print(f"Captured {image.size[0]}x{image.size[1]} from {_usb_camera_name or 'camera 0'}")
 
     return image
 

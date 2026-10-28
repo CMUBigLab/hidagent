@@ -279,6 +279,37 @@ def click_mouse(x, y, button="left"):
     send_serial_message(f"{cmd}\n")
 
 
+def move_mouse_visual(x, y, tol=1.0):
+    """Move the pointer onto (x, y) by watching it in the capture.
+
+    Unlike move_mouse(), this doesn't depend on a calibration: it finds the
+    pointer on screen and corrects until it is within tol pixels (see
+    cursor.py). Coordinates are in get_screenshot() pixels.
+
+    Returns {"cmd", "pos", "err", "iters", "verified"}, or None if the
+    pointer was never found (e.g. the target is under the iPhone's Dynamic
+    Island). verified is False when the pointer was invisible at the final
+    spot (e.g. over a black icon) and pos was estimated from nearby landings.
+    """
+    from .cursor import get_positioner
+    return get_positioner().goto(x, y, tol=tol)
+
+
+def click_mouse_visual(x, y, tol=1.0):
+    """Click at (x, y) after steering the pointer there visually.
+
+    The click replays the exact HID command that was seen to land on the
+    target, so it hits the same spot. Returns the same dict as
+    move_mouse_visual(), or None (without clicking) if the pointer was
+    never found.
+    """
+    from .cursor import get_positioner, hid_click
+    result = get_positioner().goto(x, y, tol=tol)
+    if result is not None:
+        hid_click(*result["cmd"])
+    return result
+
+
 def drag_down(x, y):
     """Drag downward starting from (x, y) on the target device.
 
@@ -974,7 +1005,9 @@ def send_serial_message(message, wait_response=True):
             print(f"Sent: {message.strip()}")
 
             if wait_response:
-                response = ser.readline().decode('utf-8').strip()
+                # errors="replace": a corrupted byte on the UART line
+                # shouldn't crash the caller.
+                response = ser.readline().decode('utf-8', errors='replace').strip()
                 if response:
                     print(f"Received: {response}")
                 else:
@@ -1242,10 +1275,42 @@ def _get_usb_capture():
 
 def release_usb_capture():
     """Release the persistent USB capture device (call on shutdown)."""
-    global _usb_capture
+    global _usb_capture, _screen_rect
     if _usb_capture is not None:
         _usb_capture.release()
         _usb_capture = None
+    _screen_rect = None
+
+
+_screen_rect = None  # (x0, y0, x1, y1) of the device's screen in the frame
+
+
+def get_screen_rect(refresh=False):
+    """Bounding box of the target's screen inside the capture frame.
+
+    HDMI capture letterboxes the device's picture in black. The extent is
+    taken from the brightest value each pixel reaches over several frames,
+    so dark UI near an edge (or the pointer) can't shrink it. Cached;
+    pass refresh=True after switching devices or orientation.
+    """
+    global _screen_rect
+    if _screen_rect is None or refresh:
+        cap = _get_usb_capture()
+        frames = []
+        for _ in range(15):
+            ret, frame = cap.read()
+            if ret:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        if not frames:
+            raise ValueError('Failed to capture image from webcam')
+        brightest = np.max(frames, axis=0)
+        ys, xs = np.where(brightest > 10)
+        if xs.size == 0:
+            h, w = brightest.shape
+            return (0, 0, w, h)  # all dark (screen off?); don't cache
+        _screen_rect = (int(xs.min()), int(ys.min()),
+                        int(xs.max()) + 1, int(ys.max()) + 1)
+    return _screen_rect
 
 
 def get_image_from_usb():
@@ -1263,25 +1328,12 @@ def get_image_from_usb():
     # Convert the image from OpenCV BGR format to RGB
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    # Get top-left pixel
-    top_left_pixel = frame_rgb[0, 0].astype(np.int16)
-
-    # Check if it's very dark
-    darkness_threshold = 30
-    if np.all(top_left_pixel < darkness_threshold):
-        # Compute Euclidean distance from top-left pixel.
-        # Use float32 to avoid int16 overflow in the squared distance.
-        diff = frame_rgb.astype(np.float32) - top_left_pixel.astype(np.float32)
-        dist = np.sqrt(np.sum(diff**2, axis=2))
-
-        # Mask: keep pixels that are far enough from background
-        mask = dist > 10  # tighter threshold to remove close-matching border
-
-        coords = np.argwhere(mask)
-        if coords.size > 0:
-            y0, x0 = coords.min(axis=0)
-            y1, x1 = coords.max(axis=0) + 1
-            frame_rgb = frame_rgb[y0:y1, x0:x1]
+    # If the picture is letterboxed (dark top-left corner), crop to the
+    # device's screen. The crop is computed once and reused so that
+    # screenshot coordinates stay stable from frame to frame.
+    if np.all(frame_rgb[0, 0] < 30):
+        x0, y0, x1, y1 = get_screen_rect()
+        frame_rgb = frame_rgb[y0:y1, x0:x1]
 
     # Convert to PIL Image
     image = Image.fromarray(frame_rgb)

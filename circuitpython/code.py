@@ -9,8 +9,12 @@ from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS
 from adafruit_hid.keycode import Keycode
 from adafruit_hid.mouse import Mouse
 
-# UART connection to control computer (via USB-to-serial adapter)
-uart = busio.UART(board.GP0, board.GP1, baudrate=9600)
+# UART connection to control computer (via USB-to-serial adapter).
+# timeout=0 makes uart.read() return whatever has arrived instead of
+# blocking up to 1 s (the default) waiting for a full 32-byte read, and the
+# larger buffer holds a few queued commands without overflowing.
+uart = busio.UART(board.GP0, board.GP1, baudrate=9600,
+                  timeout=0, receiver_buffer_size=512)
 
 buffer = bytearray()
 
@@ -104,6 +108,7 @@ while True:
             keyboard.release_all()
 
     elif type_param == "run":
+        # use command keyboard shortcut to run an app, works on windows/mac/ios/android
         keyboard.press(Keycode.LEFT_GUI, Keycode.SPACEBAR)
         keyboard.release_all()
         time.sleep(1)

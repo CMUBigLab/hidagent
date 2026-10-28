@@ -12,6 +12,7 @@ __pycache__/
 # Device-specific calibration (regenerated per target device)
 hidagent/calibration.json
 hidagent/cursor_map.json
+hidagent/screen_rect.json
 
 # Generated output from examples
 examples/dataset/

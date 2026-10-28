@@ -233,8 +233,10 @@ def _save_calibration(x_ratio, y_ratio, metadata=None):
     _save_calibrations(calibrations)
 
 
-# Try to load saved calibration on import
-_load_calibration()
+# Try to load saved calibration on import. Don't auto-calibrate here: that
+# sweeps the pointer for minutes, and a dark app screen is easily mistaken
+# for an unknown device. Call calibrate() explicitly instead.
+_load_calibration(auto_calibrate=False)
 
 
 # ============================================================
@@ -295,18 +297,24 @@ def move_mouse_visual(x, y, tol=1.0):
     return get_positioner().goto(x, y, tol=tol)
 
 
-def click_mouse_visual(x, y, tol=1.0):
+def click_mouse_visual(x, y, tol=1.0, max_err=5.0):
     """Click at (x, y) after steering the pointer there visually.
 
     The click replays the exact HID command that was seen to land on the
     target, so it hits the same spot. Returns the same dict as
-    move_mouse_visual(), or None (without clicking) if the pointer was
-    never found.
+    move_mouse_visual() plus "clicked". It does not click (clicked=False)
+    if the pointer ended more than max_err pixels from the target, and
+    returns None (without clicking) if the pointer was never found.
     """
     from .cursor import get_positioner, hid_click
     result = get_positioner().goto(x, y, tol=tol)
     if result is not None:
-        hid_click(*result["cmd"])
+        result["clicked"] = result["err"] <= max_err
+        if result["clicked"]:
+            hid_click(*result["cmd"])
+        else:
+            print(f"click_mouse_visual: pointer ended {result['err']:.1f}px "
+                  f"from ({x}, {y}); not clicking")
     return result
 
 
@@ -1283,15 +1291,38 @@ def release_usb_capture():
 
 
 _screen_rect = None  # (x0, y0, x1, y1) of the device's screen in the frame
+_SCREEN_RECT_FILE = os.path.join(os.path.dirname(__file__), "screen_rect.json")
+
+
+def _load_screen_rect(frame_shape):
+    try:
+        with open(_SCREEN_RECT_FILE) as f:
+            return tuple(json.load(f)[f"{frame_shape[1]}x{frame_shape[0]}"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _save_screen_rect(frame_shape, rect):
+    try:
+        with open(_SCREEN_RECT_FILE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    saved[f"{frame_shape[1]}x{frame_shape[0]}"] = list(rect)
+    with open(_SCREEN_RECT_FILE, "w") as f:
+        json.dump(saved, f)
 
 
 def get_screen_rect(refresh=False):
     """Bounding box of the target's screen inside the capture frame.
 
     HDMI capture letterboxes the device's picture in black. The extent is
-    taken from the brightest value each pixel reaches over several frames,
-    so dark UI near an edge (or the pointer) can't shrink it. Cached;
-    pass refresh=True after switching devices or orientation.
+    taken from the brightest value each pixel reaches over several frames.
+    A dark app (black background reaching the screen edges) is
+    indistinguishable from the letterbox, so detection can only shrink the
+    true rect; it is therefore merged with the rect saved from earlier runs
+    (screen_rect.json). Cached; pass refresh=True after switching devices
+    or orientation to discard the saved rect.
     """
     global _screen_rect
     if _screen_rect is None or refresh:
@@ -1308,8 +1339,15 @@ def get_screen_rect(refresh=False):
         if xs.size == 0:
             h, w = brightest.shape
             return (0, 0, w, h)  # all dark (screen off?); don't cache
-        _screen_rect = (int(xs.min()), int(ys.min()),
-                        int(xs.max()) + 1, int(ys.max()) + 1)
+        rect = (int(xs.min()), int(ys.min()),
+                int(xs.max()) + 1, int(ys.max()) + 1)
+        saved = None if refresh else _load_screen_rect(brightest.shape)
+        if saved is not None:
+            rect = (min(rect[0], saved[0]), min(rect[1], saved[1]),
+                    max(rect[2], saved[2]), max(rect[3], saved[3]))
+        if rect != saved:
+            _save_screen_rect(brightest.shape, rect)
+        _screen_rect = rect
     return _screen_rect
 
 

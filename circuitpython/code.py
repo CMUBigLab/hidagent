@@ -87,11 +87,14 @@ while True:
     elif type_param == "nudge":
         # Relative move from the current position, no corner reset. Small,
         # slow steps keep iOS pointer acceleration out of it, so this is for
-        # short visual-feedback corrections rather than long moves.
-        move_in_chunks(x_param, y_param, chunk=1, delay=0.02)
+        # short visual-feedback corrections rather than long moves. "step"
+        # (units per report) and "delay" trade speed for linearity.
+        move_in_chunks(x_param, y_param, chunk=command_json.get("step", 1),
+                       delay=command_json.get("delay", 0.02))
 
     elif type_param == "nudgeclick":
-        move_in_chunks(x_param, y_param, chunk=1, delay=0.02)
+        move_in_chunks(x_param, y_param, chunk=command_json.get("step", 1),
+                       delay=command_json.get("delay", 0.02))
         time.sleep(0.2)
         mouse.click(Mouse.LEFT_BUTTON)
 

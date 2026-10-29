@@ -43,11 +43,16 @@ VOLATILE_MIN_COUNT = 1.6  # ~2 recent changes before a pixel is ignored
 SCENE_CHANGE_FRAC = 0.01  # large non-cursor change over this -> rebuild bg
 DEFAULT_RADIUS = 10.7     # iOS pointer radius in screenshot pixels
 DEFAULT_PX_PER_HID = 0.764
-NUDGE_PX_PER_HID = 0.30   # nudges are slow single-unit steps: linear, ~0.3 px
-NUDGE_MAX_PX = 20.0       # nudges move ~15 px/s, so farther targets get an
-                          # absolute move first
-NUDGE_INIT_UNITS = 120    # nudge used to take the cursor-free background
-                          # (~36 px: clear of the pointer's own diameter)
+# Nudge speeds as (units per report, delay, px per unit). Each is linear, but
+# iOS acceleration gives each its own gain. FINE handles the last few px;
+# FAST (5x quicker) is unreliable for very short hops, so it's only used for
+# hops over NUDGE_FAST_PX.
+NUDGE_FINE = (1, 0.02, 0.30)
+NUDGE_FAST = (3, 0.01, 0.41)
+NUDGE_FAST_PX = 12.0
+NUDGE_MAX_PX = 100.0      # farther targets get an absolute move first
+NUDGE_INIT_PX = 36.0      # nudge used to take the cursor-free background
+                          # (clear of the pointer's own diameter)
 
 
 def hid_move(hx, hy):
@@ -62,12 +67,12 @@ def hid_click(hx, hy):
         {"type": "click", "x": int(hx), "y": int(hy)}) + "\n")
 
 
-def hid_nudge(dx, dy, click=False):
+def hid_nudge(dx, dy, click=False, speed=NUDGE_FINE):
     """Firmware nudge: move (dx, dy) HID units from where the pointer is,
-    in slow single-unit steps, then optionally click there."""
+    in steps of speed[0] units every speed[1] s, then optionally click."""
     return send_serial_message(json.dumps(
-        {"type": "nudgeclick" if click else "nudge",
-         "x": int(dx), "y": int(dy)}) + "\n")
+        {"type": "nudgeclick" if click else "nudge", "x": int(dx),
+         "y": int(dy), "step": speed[0], "delay": speed[1]}) + "\n")
 
 
 def _disc(r):
@@ -118,6 +123,10 @@ class CursorTracker:
             moving = np.abs(cur - prev).max(axis=2) > 14
             if self.volatile is not None:
                 moving &= self.volatile < 0.5  # e.g. a running stopwatch
+            # Capture noise flickers single pixels along sharp edges in
+            # every frame; real motion changes solid blobs.
+            moving = cv2.morphologyEx(moving.astype(np.uint8), cv2.MORPH_OPEN,
+                                      np.ones((2, 2), np.uint8))
             changed = int(moving.sum())
             if changed < SETTLE_PX or time.perf_counter() - t0 > SETTLE_TIMEOUT:
                 return cur
@@ -222,20 +231,34 @@ class CursorTracker:
             v = np.array([W / 2 - here[0] or 1.0, 0.0])
         v = v / np.hypot(*v)
         self.volatile = self._vol_count = None  # new scene
+        units = NUDGE_INIT_PX / NUDGE_FAST[2]
         for i in range(attempts):
             fa = self._learn_still(self.grab())
-            n = np.round(v * NUDGE_INIT_UNITS * (-1 if i % 2 else 1)).astype(int)
-            hid_nudge(*n)
+            n = np.round(v * units * (-1 if i % 2 else 1)).astype(int)
+            hid_nudge(*n, speed=NUDGE_FAST)
             fb = self.grab()
             d = self._mask(self._diff(fa, fb))
-            pk = self._peaks(self._score_map(d), k=2)
-            if len(pk) < 2 or pk[1][2] < MIN_SCORE:
+            pk = [p for p in self._peaks(self._score_map(d), k=4)
+                  if p[2] >= MIN_SCORE_NEAR]
+            if not pk or pk[0][2] < MIN_SCORE:
                 continue
-            if self._large_change(d, pk) > SCENE_CHANGE_FRAC:
+            if self._large_change(d, pk[:2]) > SCENE_CHANGE_FRAC:
                 continue  # still animating
-            # The pointer moved along n, so it's at the peak farther that way
-            # now (works on light and dark backgrounds alike).
-            new, old = sorted(pk, key=lambda p: -(p[0] * n[0] + p[1] * n[1]))
+            # The two spots are one nudge apart, which tells old from new on
+            # light and dark backgrounds alike. Only the stronger one has to
+            # pass MIN_SCORE: the pointer is faint over e.g. a tab bar.
+            shift = n * NUDGE_FAST[2]
+            tol = 4 + 0.3 * float(np.hypot(*shift))
+            near = lambda p, q: math.hypot(p[0] - q[0], p[1] - q[1]) <= tol
+            p1 = pk[0]
+            after = [q for q in pk[1:] if near(q, (p1[0] + shift[0], p1[1] + shift[1]))]
+            before = [q for q in pk[1:] if near(q, (p1[0] - shift[0], p1[1] - shift[1]))]
+            if after:
+                old, new = p1, after[0]
+            elif before:
+                old, new = before[0], p1
+            else:
+                continue
             self.bg = fb.copy()
             self._patch(self.bg, fa, new[0], new[1])
             self.pos = (new[0], new[1])
@@ -318,7 +341,7 @@ class CursorPositioner:
         # Whether the firmware has "nudge" (None until seen working or not;
         # older firmware silently ignores it) and its px per HID unit.
         self.nudge_ok = None
-        self.nudge_gain = np.array([NUDGE_PX_PER_HID] * 2)
+        self.nudge_gain = {s: np.array([s[2]] * 2) for s in (NUDGE_FINE, NUDGE_FAST)}
 
     # ---------------------------------------------------------- persistence
     def _load(self):
@@ -466,35 +489,40 @@ class CursorPositioner:
         """goto() via nudges; None if nudging isn't possible here."""
         t = self.t
         it = 0
-        if t.bg is None:
-            step = NUDGE_INIT_UNITS * float(self.nudge_gain.mean())
-            if t.pos is None or math.hypot(*(target - t.pos)) > 1.3 * step:
-                # One absolute move to a spot a nudge away from the target
-                # (on the screen-center side), then nudge onto the target,
-                # building the background on the way.
-                W, H = t.rect[2] - t.rect[0], t.rect[3] - t.rect[1]
-                v = np.array([W / 2, H / 2]) - target
-                v = v / np.hypot(*v) if np.hypot(*v) > 1 else np.array([1.0, 0])
-                start = target + v * step
-                it += 1
-                hid_move(*np.round(self.predict_cmd(start)).astype(int))
-                t.pos = tuple(start)
-            if t.init_background_nudge(toward=target) is None:
+        pos = None
+        near = t.pos is not None and math.hypot(*(target - t.pos)) <= NUDGE_MAX_PX
+        if t.bg is not None and near:
+            # Also notices if the screen changed since (then t.bg is None).
+            pos = t.locate(expected=t.pos, search_radius=15)
+        if pos is None and not near:
+            # One absolute move to a spot a nudge away from the target (on
+            # the screen-center side). If the screen changed, the nudge onto
+            # the target rebuilds the background; no trips to the corner.
+            W, H = t.rect[2] - t.rect[0], t.rect[3] - t.rect[1]
+            v = np.array([W / 2, H / 2]) - target
+            v = v / np.hypot(*v) if np.hypot(*v) > 1 else np.array([1.0, 0])
+            start = target + v * NUDGE_INIT_PX
+            it += 1
+            cmd = tuple(int(c) for c in np.round(self.predict_cmd(start)))
+            hid_move(*cmd)
+            t.pos = tuple(start)
+            if t.bg is not None:
+                pos = self._locate_after(cmd)
+                if pos is not None:
+                    self.obs.append((*cmd, float(pos[0]), float(pos[1])))
+        if pos is None and t.bg is not None:
+            return None  # pointer not visible here; let the caller fall back
+        if pos is None:
+            pos = t.init_background_nudge(toward=target)
+            if pos is None:
+                # Couldn't see the pointer move. That's either old firmware
+                # (no nudge) or a hidden pointer; only the first is permanent.
                 if self.nudge_ok is None:
-                    self.nudge_ok = False  # never saw a nudge move the pointer
+                    self._nudge_fails = getattr(self, "_nudge_fails", 0) + 1
+                    if self._nudge_fails >= 2:
+                        self.nudge_ok = False
                 return None
             self.nudge_ok = True
-        pos = None
-        if t.bg is not None and t.pos is not None:
-            if math.hypot(*(target - t.pos)) <= NUDGE_MAX_PX:
-                pos = t.locate(expected=t.pos, search_radius=15)
-        if pos is None:
-            # Far away (or lost): one absolute move to get close.
-            it += 1
-            cmd = tuple(int(c) for c in np.round(self.predict_cmd(target)))
-            pos = self.try_cmd(cmd)
-            if pos is None:
-                return None
         best_err, stalls, verified = None, 0, True
         while True:
             err = target - np.array(pos)
@@ -506,13 +534,16 @@ class CursorPositioner:
             best_err = dist if best_err is None else min(best_err, dist)
             if dist <= tol or stalls >= 2 or it >= max_iter or not verified:
                 break
-            n = np.round(err / self.nudge_gain).astype(int)
+            speed = NUDGE_FAST if dist > NUDGE_FAST_PX else NUDGE_FINE
+            gain = self.nudge_gain[speed]
+            n = np.round(err / gain).astype(int)
             if not n.any():
                 n[np.argmax(np.abs(err))] = int(np.sign(err[np.argmax(np.abs(err))]))
             it += 1
-            hid_nudge(*n)
-            exp = np.array(pos) + n * self.nudge_gain
-            new = t.locate(expected=exp, search_radius=15 + float(np.abs(n).max()))
+            hid_nudge(*n, speed=speed)
+            exp = np.array(pos) + n * gain
+            hop = float(np.hypot(*(n * gain)))
+            new = t.locate(expected=exp, search_radius=12 + 0.25 * hop)
             if new is None:
                 if t.bg is None:  # scene changed: start over from here
                     return None if t.init_background_nudge(toward=target) is None \
@@ -530,8 +561,8 @@ class CursorPositioner:
                     self.nudge_ok = False  # old firmware ignored the nudge
                     return None
             for a in (0, 1):
-                if abs(n[a]) >= 3 and moved[a] / n[a] > 0.1:
-                    self.nudge_gain[a] = 0.7 * self.nudge_gain[a] + 0.3 * moved[a] / n[a]
+                if abs(n[a]) >= 10 and moved[a] / n[a] > 0.1:
+                    gain[a] = 0.7 * gain[a] + 0.3 * moved[a] / n[a]
             pos = new
         self.save()
         # The pointer stays where it last landed, so report that landing.

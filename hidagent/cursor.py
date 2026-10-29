@@ -43,6 +43,11 @@ VOLATILE_MIN_COUNT = 1.6  # ~2 recent changes before a pixel is ignored
 SCENE_CHANGE_FRAC = 0.01  # large non-cursor change over this -> rebuild bg
 DEFAULT_RADIUS = 10.7     # iOS pointer radius in screenshot pixels
 DEFAULT_PX_PER_HID = 0.764
+NUDGE_PX_PER_HID = 0.30   # nudges are slow single-unit steps: linear, ~0.3 px
+NUDGE_MAX_PX = 20.0       # nudges move ~15 px/s, so farther targets get an
+                          # absolute move first
+NUDGE_INIT_UNITS = 120    # nudge used to take the cursor-free background
+                          # (~36 px: clear of the pointer's own diameter)
 
 
 def hid_move(hx, hy):
@@ -55,6 +60,14 @@ def hid_click(hx, hy):
     """Firmware click: same path as hid_move(hx, hy), then a left click."""
     return send_serial_message(json.dumps(
         {"type": "click", "x": int(hx), "y": int(hy)}) + "\n")
+
+
+def hid_nudge(dx, dy, click=False):
+    """Firmware nudge: move (dx, dy) HID units from where the pointer is,
+    in slow single-unit steps, then optionally click there."""
+    return send_serial_message(json.dumps(
+        {"type": "nudgeclick" if click else "nudge",
+         "x": int(dx), "y": int(dy)}) + "\n")
 
 
 def _disc(r):
@@ -102,7 +115,10 @@ class CursorTracker:
         t0 = time.perf_counter()
         while True:
             cur = self._crop(self._read())
-            changed = int((np.abs(cur - prev).max(axis=2) > 14).sum())
+            moving = np.abs(cur - prev).max(axis=2) > 14
+            if self.volatile is not None:
+                moving &= self.volatile < 0.5  # e.g. a running stopwatch
+            changed = int(moving.sum())
             if changed < SETTLE_PX or time.perf_counter() - t0 > SETTLE_TIMEOUT:
                 return cur
             prev = cur
@@ -140,6 +156,22 @@ class CursorTracker:
             s[max(0, y - sep):y + sep + 1, max(0, x - sep):x + sep + 1] = -1e9
         return out
 
+    def _mask(self, d):
+        return d if self.volatile is None else d * (self.volatile < 0.5)
+
+    def _learn_still(self, frame):
+        """Grab another frame without moving the pointer: whatever changed
+        is animating on its own (a running timer, a video) and is ignored
+        from now on."""
+        again = self.grab()
+        changed = (self._diff(frame, again) > VOLATILE_THRESH).astype(np.uint8)
+        changed = cv2.dilate(changed, np.ones((7, 7), np.uint8)).astype(np.float32)
+        if changed.any():
+            base = np.zeros_like(changed) if self._vol_count is None else self._vol_count
+            self._vol_count = np.maximum(base, changed * 3 * VOLATILE_MIN_COUNT)
+            self.volatile = (self._vol_count >= VOLATILE_MIN_COUNT).astype(np.float32)
+        return again
+
     def _patch(self, dst, src, x, y, pad=5):
         r = int(math.ceil(self.radius)) + pad
         H, W = dst.shape[:2]
@@ -149,12 +181,13 @@ class CursorTracker:
 
     def init_background(self, a=(100, 100), b=(300, 600), attempts=3):
         """Build a cursor-free background from two well-separated landings."""
+        self.volatile = self._vol_count = None  # new scene
         for _ in range(attempts):
             hid_move(*a)
-            fa = self.grab()
+            fa = self._learn_still(self.grab())
             hid_move(*b)
             fb = self.grab()
-            pk = self._peaks(self._score_map(self._diff(fa, fb)), k=2)
+            pk = self._peaks(self._score_map(self._mask(self._diff(fa, fb))), k=2)
             if len(pk) == 2 and pk[1][2] >= MIN_SCORE:
                 break
         else:
@@ -174,6 +207,41 @@ class CursorTracker:
         self.pos = (new[0], new[1])
         return self.pos
 
+    def init_background_nudge(self, toward=None, attempts=2):
+        """Like init_background(), but by nudging the pointer from wherever
+        it is instead of sending it to the corner twice. Needs the nudge
+        firmware. toward: optional (x, y) to nudge toward (e.g. the next
+        target), so the move also makes progress. Returns the new position,
+        or None if the pointer couldn't be seen moving (old firmware, or the
+        pointer is hidden)."""
+        W, H = self.rect[2] - self.rect[0], self.rect[3] - self.rect[1]
+        here = self.pos if self.pos is not None else (W / 2, H / 2)
+        goal = toward if toward is not None else (W / 2, H / 2)
+        v = np.array(goal, float) - here
+        if np.hypot(*v) < 1:
+            v = np.array([W / 2 - here[0] or 1.0, 0.0])
+        v = v / np.hypot(*v)
+        self.volatile = self._vol_count = None  # new scene
+        for i in range(attempts):
+            fa = self._learn_still(self.grab())
+            n = np.round(v * NUDGE_INIT_UNITS * (-1 if i % 2 else 1)).astype(int)
+            hid_nudge(*n)
+            fb = self.grab()
+            d = self._mask(self._diff(fa, fb))
+            pk = self._peaks(self._score_map(d), k=2)
+            if len(pk) < 2 or pk[1][2] < MIN_SCORE:
+                continue
+            if self._large_change(d, pk) > SCENE_CHANGE_FRAC:
+                continue  # still animating
+            # The pointer moved along n, so it's at the peak farther that way
+            # now (works on light and dark backgrounds alike).
+            new, old = sorted(pk, key=lambda p: -(p[0] * n[0] + p[1] * n[1]))
+            self.bg = fb.copy()
+            self._patch(self.bg, fa, new[0], new[1])
+            self.pos = (new[0], new[1])
+            return self.pos
+        return None
+
     def locate(self, expected=None, search_radius=60):
         """Find the cursor in a newly settled frame.
 
@@ -185,7 +253,7 @@ class CursorTracker:
         """
         frame = self.grab()
         d_raw = self._diff(self.bg, frame)
-        d = d_raw if self.volatile is None else d_raw * (self.volatile < 0.5)
+        d = self._mask(d_raw)
         pk = self._peaks(self._score_map(d))
         if expected is None:
             pk = [p for p in pk if p[2] >= MIN_SCORE]
@@ -196,7 +264,7 @@ class CursorTracker:
                 key=dist)
         self.last_peaks = pk
         found = pk[0][:2] if pk else None
-        self.scene_change = self._large_change(d_raw, [self.pos, found])
+        self.scene_change = self._large_change(d, [self.pos, found])
         if self.scene_change > SCENE_CHANGE_FRAC:
             self.bg = None
             return None
@@ -247,6 +315,10 @@ class CursorPositioner:
         x0, y0, x1, y1 = self.t.rect
         self._key = f"{x1 - x0}x{y1 - y0}"
         self.obs = self._load()  # [(hx, hy, px, py)]
+        # Whether the firmware has "nudge" (None until seen working or not;
+        # older firmware silently ignores it) and its px per HID unit.
+        self.nudge_ok = None
+        self.nudge_gain = np.array([NUDGE_PX_PER_HID] * 2)
 
     # ---------------------------------------------------------- persistence
     def _load(self):
@@ -365,15 +437,110 @@ class CursorPositioner:
     def goto(self, tx, ty, tol=1.0, max_iter=8):
         """Steer the cursor onto (tx, ty).
 
-        Returns {"cmd", "pos", "err", "iters", "verified", "snapped"} for the
-        closest landing (the cursor is left there), or None if the cursor
-        was never found. verified is False when the pointer was invisible at
-        the final spot (e.g. over a black icon) and pos was estimated from
-        the visible landings around it. snapped is True when iOS jumps the
-        resting pointer across the target (it snaps onto nearby app icons),
-        so the exact pixel can't be reached; pos is then the closest
-        reachable landing.
+        Returns {"cmd", "pos", "err", "iters", "verified", "snapped",
+        "nudged"}, or None if the cursor was never found.
+
+        With the nudge firmware, the cursor gets there with at most one
+        absolute move (from the corner) and then short relative nudges, and
+        is left exactly at pos; nudged is True and cmd is None, since the
+        spot isn't reachable by a single absolute command. Otherwise every
+        try is an absolute move and cmd is the command that lands on pos.
+
+        verified is False when the pointer was invisible at the final spot
+        (e.g. over a black icon) and pos was estimated from the visible
+        landings around it. snapped is True when iOS jumps the resting
+        pointer across the target (it snaps onto nearby app icons), so the
+        exact pixel can't be reached; pos is then the closest reachable
+        landing.
         """
+        if self.nudge_ok is not False:
+            result = self._goto_nudge(np.array([tx, ty], float), tol, max_iter)
+            if result is not None:
+                return result
+        result = self._goto_absolute(tx, ty, tol, max_iter)
+        if result is not None:
+            result["nudged"] = False
+        return result
+
+    def _goto_nudge(self, target, tol, max_iter):
+        """goto() via nudges; None if nudging isn't possible here."""
+        t = self.t
+        it = 0
+        if t.bg is None:
+            step = NUDGE_INIT_UNITS * float(self.nudge_gain.mean())
+            if t.pos is None or math.hypot(*(target - t.pos)) > 1.3 * step:
+                # One absolute move to a spot a nudge away from the target
+                # (on the screen-center side), then nudge onto the target,
+                # building the background on the way.
+                W, H = t.rect[2] - t.rect[0], t.rect[3] - t.rect[1]
+                v = np.array([W / 2, H / 2]) - target
+                v = v / np.hypot(*v) if np.hypot(*v) > 1 else np.array([1.0, 0])
+                start = target + v * step
+                it += 1
+                hid_move(*np.round(self.predict_cmd(start)).astype(int))
+                t.pos = tuple(start)
+            if t.init_background_nudge(toward=target) is None:
+                if self.nudge_ok is None:
+                    self.nudge_ok = False  # never saw a nudge move the pointer
+                return None
+            self.nudge_ok = True
+        pos = None
+        if t.bg is not None and t.pos is not None:
+            if math.hypot(*(target - t.pos)) <= NUDGE_MAX_PX:
+                pos = t.locate(expected=t.pos, search_radius=15)
+        if pos is None:
+            # Far away (or lost): one absolute move to get close.
+            it += 1
+            cmd = tuple(int(c) for c in np.round(self.predict_cmd(target)))
+            pos = self.try_cmd(cmd)
+            if pos is None:
+                return None
+        best_err, stalls, verified = None, 0, True
+        while True:
+            err = target - np.array(pos)
+            dist = float(np.hypot(*err))
+            if best_err is None or dist < best_err - 0.2:
+                stalls = 0
+            else:
+                stalls += 1
+            best_err = dist if best_err is None else min(best_err, dist)
+            if dist <= tol or stalls >= 2 or it >= max_iter or not verified:
+                break
+            n = np.round(err / self.nudge_gain).astype(int)
+            if not n.any():
+                n[np.argmax(np.abs(err))] = int(np.sign(err[np.argmax(np.abs(err))]))
+            it += 1
+            hid_nudge(*n)
+            exp = np.array(pos) + n * self.nudge_gain
+            new = t.locate(expected=exp, search_radius=15 + float(np.abs(n).max()))
+            if new is None:
+                if t.bg is None:  # scene changed: start over from here
+                    return None if t.init_background_nudge(toward=target) is None \
+                        else self._goto_nudge(target, tol, max_iter - it)
+                # Invisible here (e.g. over a black icon): nudges are
+                # near-linear over short hops, so estimate where it went.
+                pos, verified = tuple(exp), False
+                t.pos = pos
+                continue
+            moved = np.array(new) - np.array(pos)
+            if self.nudge_ok is None:
+                if np.abs(moved).max() > 0.5:
+                    self.nudge_ok = True
+                elif np.abs(n).max() >= 3:
+                    self.nudge_ok = False  # old firmware ignored the nudge
+                    return None
+            for a in (0, 1):
+                if abs(n[a]) >= 3 and moved[a] / n[a] > 0.1:
+                    self.nudge_gain[a] = 0.7 * self.nudge_gain[a] + 0.3 * moved[a] / n[a]
+            pos = new
+        self.save()
+        # The pointer stays where it last landed, so report that landing.
+        return {"cmd": None, "pos": tuple(float(v) for v in pos),
+                "err": float(np.hypot(*(target - np.array(pos)))),
+                "verified": verified, "iters": it, "snapped": False,
+                "nudged": True}
+
+    def _goto_absolute(self, tx, ty, tol=1.0, max_iter=8):
         target = np.array([tx, ty], float)
         cmd = np.round(self.predict_cmd(target)).astype(int)
         lo, hi = [None, None], [None, None]  # per-axis bracket on the command

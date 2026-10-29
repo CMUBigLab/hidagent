@@ -300,17 +300,21 @@ def move_mouse_visual(x, y, tol=1.0):
 def click_mouse_visual(x, y, tol=1.0, max_err=5.0):
     """Click at (x, y) after steering the pointer there visually.
 
-    The click replays the exact HID command that was seen to land on the
-    target, so it hits the same spot. Returns the same dict as
-    move_mouse_visual() plus "clicked". It does not click (clicked=False)
-    if the pointer ended more than max_err pixels from the target, and
-    returns None (without clicking) if the pointer was never found.
+    With the nudge firmware the click happens where the pointer was last
+    seen, without moving it; otherwise the click replays the exact HID
+    command that was seen to land on the target, which hits the same spot.
+    Returns the same dict as move_mouse_visual() plus "clicked". It does
+    not click (clicked=False) if the pointer ended more than max_err pixels
+    from the target, and returns None (without clicking) if the pointer was
+    never found.
     """
-    from .cursor import get_positioner, hid_click
+    from .cursor import get_positioner, hid_click, hid_nudge
     result = get_positioner().goto(x, y, tol=tol)
     if result is not None:
         result["clicked"] = result["err"] <= max_err
-        if result["clicked"]:
+        if result["clicked"] and result["nudged"]:
+            hid_nudge(0, 0, click=True)
+        elif result["clicked"]:
             hid_click(*result["cmd"])
         else:
             print(f"click_mouse_visual: pointer ended {result['err']:.1f}px "

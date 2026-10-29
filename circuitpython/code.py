@@ -84,6 +84,17 @@ while True:
         time.sleep(0.1)
         move_in_chunks(x_param, y_param)
 
+    elif type_param == "nudge":
+        # Relative move from the current position, no corner reset. Small,
+        # slow steps keep iOS pointer acceleration out of it, so this is for
+        # short visual-feedback corrections rather than long moves.
+        move_in_chunks(x_param, y_param, chunk=1, delay=0.02)
+
+    elif type_param == "nudgeclick":
+        move_in_chunks(x_param, y_param, chunk=1, delay=0.02)
+        time.sleep(0.2)
+        mouse.click(Mouse.LEFT_BUTTON)
+
     elif type_param == "type":
         keyboard_layout.write(text_param)
 

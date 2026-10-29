@@ -4,7 +4,7 @@ Timing benchmark for HIDAgent components.
 Runs each component 1000 times and reports timing statistics:
   1. get_screenshot()        — capture via HDMI
   2. send_serial_message()   — send a "run" command over serial
-  3. move_mouse(50, 50)      — move mouse to a fixed position
+  3. hid_move(100, 100)      — raw firmware move to a fixed position
   4. gui_diff(img1, img2)    — diff two different screenshots
 
 Usage:
@@ -26,8 +26,10 @@ from io import BytesIO
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hidagent.hidagent import (
-    get_screenshot, move_mouse, send_serial_message, gui_diff,
+    get_screenshot, send_serial_message, gui_diff,
 )
+# The raw firmware move (move_mouse() now also watches the pointer).
+from hidagent.cursor import hid_move
 from anthropic import Anthropic
 import json
 
@@ -115,9 +117,9 @@ def main():
     # 3. Move mouse to (50, 50)
     # ----------------------------------------------------------------
     def mouse_move():
-        move_mouse(50, 50)
+        hid_move(100, 100)
 
-    results.append(benchmark(mouse_move, n, "move_mouse(50, 50)"))
+    results.append(benchmark(mouse_move, n, "hid_move(100, 100)"))
 
     # ----------------------------------------------------------------
     # 4. gui_diff with varying image pairs
@@ -136,7 +138,7 @@ def main():
         if (i + 1) % max(1, pool_size // 5) == 0:
             print(f"  Captured {i+1}/{pool_size}")
         # Small mouse jitter between captures to ensure images differ
-        move_mouse(50 + (i % 5) * 20, 50 + (i % 3) * 20)
+        hid_move(100 + (i % 5) * 40, 100 + (i % 3) * 40)
         time.sleep(0.05)
 
     pair_idx = [0]

@@ -858,18 +858,12 @@ def action():
     y = data.get("y", 0)
     text = data.get("text", "")
 
-    # Element coordinates are in full-screenshot space (e.g., 449x982).
-    # click_mouse expects coordinates in the calibration's half-size space
-    # (e.g., 224x491). Scale down by the calibration resize factor.
-    resize_factor = 2
-    cal_x = int(x / resize_factor)
-    cal_y = int(y / resize_factor)
-
+    # Element coordinates are in screenshot pixels, as click_mouse expects.
     if action_type == "click":
-        click_mouse(cal_x, cal_y)
+        click_mouse(x, y)
 
     elif action_type == "type_at":
-        click_mouse(cal_x, cal_y)
+        click_mouse(x, y)
         time.sleep(0.5)
         type_text(text)
 

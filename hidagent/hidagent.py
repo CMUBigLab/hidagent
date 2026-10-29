@@ -233,10 +233,9 @@ def _save_calibration(x_ratio, y_ratio, metadata=None):
     _save_calibrations(calibrations)
 
 
-# Try to load saved calibration on import. Don't auto-calibrate here: that
-# sweeps the pointer for minutes, and a dark app screen is easily mistaken
-# for an unknown device. Call calibrate() explicitly instead.
-_load_calibration(auto_calibrate=False)
+# Pointer functions locate the pointer visually (cursor.py), so nothing is
+# loaded here. The HID-ratio calibration (calibrate(), _load_calibration())
+# is kept for setups without a video capture.
 
 
 # ============================================================
@@ -252,102 +251,85 @@ def get_screenshot():
     return get_image_from_usb()
 
 
-def move_mouse(x, y):
-    """Move the mouse to location (x, y) on the target device.
+def move_mouse(x, y, tol=1.0):
+    """Move the pointer onto (x, y), in get_screenshot() pixels.
 
-    Coordinates are in the target device's screen pixel space
-    (after applying the calibrated HID ratio).
-    """
-    cmd = json.dumps({
-        "type": "move",
-        "x": int(x * hid_x_ratio),
-        "y": int(y * hid_y_ratio),
-    })
-    send_serial_message(f"{cmd}\n")
+    The pointer is found in the HDMI capture and steered until it is within
+    tol pixels, so no calibration is needed (see cursor.py).
 
-
-def click_mouse(x, y, button="left"):
-    """Move the mouse to (x, y) and click.
-
-    Args:
-        x, y: Target device screen coordinates.
-        button: "left" (default) or "right".
-    """
-    cmd = json.dumps({
-        "type": "click",
-        "x": int(x * hid_x_ratio),
-        "y": int(y * hid_y_ratio),
-    })
-    send_serial_message(f"{cmd}\n")
-
-
-def move_mouse_visual(x, y, tol=1.0):
-    """Move the pointer onto (x, y) by watching it in the capture.
-
-    Unlike move_mouse(), this doesn't depend on a calibration: it finds the
-    pointer on screen and corrects until it is within tol pixels (see
-    cursor.py). Coordinates are in get_screenshot() pixels.
-
-    Returns {"cmd", "pos", "err", "iters", "verified"}, or None if the
-    pointer was never found (e.g. the target is under the iPhone's Dynamic
-    Island). verified is False when the pointer was invisible at the final
-    spot (e.g. over a black icon) and pos was estimated from nearby landings.
+    Returns {"cmd", "pos", "err", "iters", "verified", "snapped", "nudged"},
+    or None if the pointer was never found (e.g. under the iPhone's Dynamic
+    Island, or in menus where iOS hides it). verified is False when the
+    pointer was invisible at the final spot (e.g. over a black icon) and pos
+    was estimated.
     """
     from .cursor import get_positioner
     return get_positioner().goto(x, y, tol=tol)
 
 
-def click_mouse_visual(x, y, tol=1.0, max_err=5.0):
-    """Click at (x, y) after steering the pointer there visually.
+def click_mouse(x, y, button="left", tol=1.0, max_err=5.0):
+    """Click at (x, y), in get_screenshot() pixels.
 
-    With the nudge firmware the click happens where the pointer was last
-    seen, without moving it; otherwise the click replays the exact HID
-    command that was seen to land on the target, which hits the same spot.
-    Returns the same dict as move_mouse_visual() plus "clicked". It does
-    not click (clicked=False) if the pointer ended more than max_err pixels
-    from the target, and returns None (without clicking) if the pointer was
-    never found.
+    Steers the pointer there as move_mouse() does, then clicks where it was
+    seen (with the nudge firmware) or replays the exact command that was
+    seen to land there. Only left clicks are supported by the firmware.
+
+    Returns move_mouse()'s dict plus "clicked". It doesn't click
+    (clicked=False) if the pointer ended more than max_err pixels from the
+    target. If the pointer can't be seen at all (iOS hides it in some menus)
+    it clicks with the command the learned map predicts, and returns
+    {"pos": None, "verified": False, "clicked": True, "blind": True}.
     """
     from .cursor import get_positioner, hid_click, hid_nudge
-    result = get_positioner().goto(x, y, tol=tol)
-    if result is not None:
-        result["clicked"] = result["err"] <= max_err
-        if result["clicked"] and result["nudged"]:
-            hid_nudge(0, 0, click=True)
-        elif result["clicked"]:
-            hid_click(*result["cmd"])
-        else:
-            print(f"click_mouse_visual: pointer ended {result['err']:.1f}px "
-                  f"from ({x}, {y}); not clicking")
+    p = get_positioner()
+    result = p.goto(x, y, tol=tol)
+    if result is None:
+        cmd = tuple(int(round(c)) for c in p.predict_cmd((x, y)))
+        print(f"click_mouse: pointer not visible near ({x}, {y}); "
+              f"clicking from the learned map")
+        hid_click(*cmd)
+        return {"cmd": cmd, "pos": None, "err": None, "verified": False,
+                "clicked": True, "blind": True}
+    result["clicked"] = result["err"] <= max_err
+    if result["clicked"] and result["nudged"]:
+        hid_nudge(0, 0, click=True)
+    elif result["clicked"]:
+        hid_click(*result["cmd"])
+    else:
+        print(f"click_mouse: pointer ended {result['err']:.1f}px "
+              f"from ({x}, {y}); not clicking")
     return result
 
 
-def drag_down(x, y):
-    """Drag downward starting from (x, y) on the target device.
+# Earlier names for the same functions.
+move_mouse_visual = move_mouse
+click_mouse_visual = click_mouse
 
-    Moves to (x, y), presses left button, drags down, and releases. Used
-    for gestures like swiping down to open Control Center on iPhone.
-    """
-    cmd = json.dumps({
-        "type": "dragdown",
-        "x": int(x * hid_x_ratio),
-        "y": int(y * hid_y_ratio),
-    })
+
+def _drag(kind, x, y):
+    from .cursor import get_positioner
+    hx, hy = get_positioner().command_for(x, y)
+    cmd = json.dumps({"type": kind, "x": hx, "y": hy})
     send_serial_message(f"{cmd}\n")
 
 
+def drag_down(x, y):
+    """Drag downward starting from (x, y), in get_screenshot() pixels.
+
+    Moves to (x, y), presses left button, drags down, and releases. Used
+    for gestures like swiping down to open Control Center on iPhone (start
+    at the top edge, e.g. y=0).
+    """
+    _drag("dragdown", x, y)
+
+
 def drag_up(x, y):
-    """Drag upward starting from (x, y) on the target device.
+    """Drag upward starting from (x, y), in get_screenshot() pixels.
 
     Moves to (x, y), presses left button, drags up, and releases. Used
     for gestures like scrolling a feed.
     """
-    cmd = json.dumps({
-        "type": "dragup",
-        "x": int(x * hid_x_ratio),
-        "y": int(y * hid_y_ratio),
-    })
-    send_serial_message(f"{cmd}\n")
+    _drag("dragup", x, y)
 
 
 def type_text(text):
@@ -888,7 +870,13 @@ def sampling_loop(
         # Add tool results to messages for the next iteration with Claude
         messages.append({"role": "user", "content": tool_results})
 
+# Screenshot pixels per pixel of the (possibly downsized) image last sent to
+# the model, for mapping its click coordinates back.
+_screenshot_scale = (1.0, 1.0)
+
+
 def run_tool(tool_name, tool_input):
+    global _screenshot_scale
     print(f"Running tool: {tool_name} with input: {tool_input}")
 
     if tool_name == "computer" and "action" in tool_input and tool_input["action"] == "screenshot":
@@ -897,8 +885,11 @@ def run_tool(tool_name, tool_input):
         img.save(buffered, format="PNG")
         img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-        # Resize image if it's too large
+        # Resize image if it's too large; clicks scale coordinates back up
+        _screenshot_scale = (1.0, 1.0)
         if img.width > 1000 or img.height > 800:
+            _screenshot_scale = (img.width / (img.width // 2),
+                                 img.height / (img.height // 2))
             img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
             buffered = BytesIO()
             img.save(buffered, format="PNG")
@@ -939,8 +930,7 @@ def run_tool(tool_name, tool_input):
         y = tool_input["coordinate"][1]
         if x is None or y is None:
             return [{"type": "text", "text": "Error: Missing x or y coordinate for left_click"}]
-        move_command = json.dumps({"type": "click", "x": int(x*hid_x_ratio), "y": int(y*hid_y_ratio)})
-        send_serial_message(f"{move_command}\n")
+        click_mouse(x * _screenshot_scale[0], y * _screenshot_scale[1])
         return [{"type": "text", "text": f"Clicked at ({x}, {y})"}]
 
     elif tool_name == "computer" and "action" in tool_input and tool_input["action"] == "wait":

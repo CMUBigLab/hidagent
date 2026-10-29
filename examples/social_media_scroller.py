@@ -51,7 +51,7 @@ def start_screen_recording():
     """
     print("  Starting screen recording...")
     # Swipe down from top-right for Control Center (iPhone with notch)
-    drag_down(220, 0)
+    drag_down(440, 0)
     time.sleep(1)
 
     # Take screenshot and find the record button
@@ -60,18 +60,16 @@ def start_screen_recording():
     location = patch_location(record_btn, screenshot)
 
     if location:
-        # Click the center of the detected button. patch_location returns
-        # coords in full-res screenshot space; click_mouse expects
-        # calibration space (half-res, image_resize_factor=2).
+        # Click the center of the detected button (screenshot pixels).
         btn_x = location["x"] + location["width"] // 2
         btn_y = location["y"] + location["height"] // 2
         print(f"  Found record button at ({btn_x}, {btn_y}) "
               f"confidence={location['confidence']:.2f}")
-        click_mouse(int(btn_x * 0.5), int(btn_y * 0.5))
+        click_mouse(btn_x, btn_y)
     else:
         # Fallback to approximate position if button not found
         print("  Record button not found, using fallback position")
-        click_mouse(200, 400)
+        click_mouse(400, 800)
 
     time.sleep(1)  # iOS gives a 3-second countdown
 
@@ -80,11 +78,11 @@ def stop_screen_recording():
     """Stop screen recording by tapping the red status bar."""
     print("  Stopping screen recording...")
     # Tap the red recording indicator at the top of screen
-    click_mouse(200, 5)
+    click_mouse(400, 10)
     time.sleep(1)
 
     # Confirm stop
-    click_mouse(200, 300)
+    click_mouse(400, 600)
     time.sleep(1)
 
 
@@ -97,7 +95,7 @@ def open_app(app_name):
 
 def scroll_feed(scroll_amount_y, pause_between=1.0):
     """Scroll the feed by a specified amount."""
-    drag_up(150, 150)
+    drag_up(300, 300)
     time.sleep(pause_between)
 
 
@@ -108,7 +106,7 @@ def navigate_to_feed(app_name):
     """
     print("  Navigating to main feed...")
     # Bottom-left icon is typically the home/feed tab
-    click_mouse(30, 500)
+    click_mouse(60, 940)
     time.sleep(2)
 
 

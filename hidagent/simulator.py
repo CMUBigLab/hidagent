@@ -488,9 +488,33 @@ def patch_hidagent(sim):
         else:
             print(f"  [Simulator] Unknown command type: {cmd_type}")
 
+    # The pointer functions normally watch the pointer in the HDMI capture;
+    # the Simulator takes screenshot coordinates directly.
+    def _result(x, y):
+        return {"cmd": None, "pos": (x, y), "err": 0.0, "iters": 0,
+                "verified": True, "snapped": False, "nudged": False}
+
+    def sim_move_mouse(x, y, **kwargs):
+        sim.move(int(x), int(y))
+        return _result(x, y)
+
+    def sim_click_mouse(x, y, button="left", **kwargs):
+        sim.click(int(x), int(y))
+        return {**_result(x, y), "clicked": True}
+
+    def sim_drag_down(x, y):
+        sim.drag(int(x), int(y), int(x), int(y) + 125, duration=0.3)
+
+    def sim_drag_up(x, y):
+        sim.drag(int(x), int(y), int(x), int(y) - 125, duration=0.3)
+
     # Apply patches
     ha.get_image_from_usb = sim_get_image_from_usb
     ha.send_serial_message = sim_send_serial_message
+    ha.move_mouse = ha.move_mouse_visual = sim_move_mouse
+    ha.click_mouse = ha.click_mouse_visual = sim_click_mouse
+    ha.drag_down = sim_drag_down
+    ha.drag_up = sim_drag_up
 
     # Set ratios to 1:1 since Simulator screenshots are in device pixels
     # and the patch converts back from HID coords to device coords

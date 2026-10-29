@@ -485,6 +485,21 @@ class CursorPositioner:
             result["nudged"] = False
         return result
 
+    def command_for(self, tx, ty, tol=1.0, max_err=5.0):
+        """Absolute HID command that lands on (tx, ty).
+
+        For firmware commands that start from the corner (drags). Steers
+        with absolute moves only; near the screen edge (where the pointer
+        stops short, e.g. edge swipes) or if the pointer can't be seen, uses
+        the learned map instead. The pointer is left on the target.
+        """
+        W, H = self.t.rect[2] - self.t.rect[0], self.t.rect[3] - self.t.rect[1]
+        if min(tx, ty, W - tx, H - ty) > 10:
+            r = self._goto_absolute(tx, ty, tol)
+            if r is not None and r["err"] <= max_err:
+                return r["cmd"]
+        return tuple(int(c) for c in np.round(self.predict_cmd((tx, ty))))
+
     def _goto_nudge(self, target, tol, max_iter):
         """goto() via nudges; None if nudging isn't possible here."""
         t = self.t

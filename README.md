@@ -65,19 +65,25 @@ Plug the HDMI capture card into your control computer (USB) and into the
 target device (HDMI). The capture card should appear as a webcam in macOS
 camera settings.
 
-### Step 7: Calibrate
+### No calibration needed
 
-Run the calibration procedure to learn the mapping between HID coordinates
-and pixel positions:
+`move_mouse`, `click_mouse`, `drag_down` and `drag_up` take coordinates in
+`get_screenshot()` pixels. HIDAgent finds the pointer in the HDMI capture
+and steers it onto the target (within about a pixel), so there's no
+calibration step, and a new device works right away. Where the pointer
+lands is remembered in `hidagent/cursor_map.json` (per screen size) so
+later moves start close; deleting it only makes the first moves a little
+slower. The screen's position in the capture frame is saved in
+`hidagent/screen_rect.json`; if you change devices or orientation, delete it
+or call `get_screen_rect(refresh=True)` once while the screen shows
+something bright out to its edges (e.g. the home screen).
 
-```bash
-python test_calibration.py
-```
+On iPhone, iOS hides the pointer in a few places (e.g. the AssistiveTouch
+menu). `click_mouse` then clicks from what it has learned and marks the
+result `blind`.
 
-This takes ~5 minutes. The calibration result is saved to
-`hidagent/calibration.json` and is automatically loaded on subsequent runs.
-If you switch to a different target device, the calibration is keyed on
-screen resolution so previous calibrations are reused automatically.
+`calibrate()` (a fixed HID-to-pixel ratio) is still available for setups
+without a video capture, but the pointer functions don't use it.
 
 ## Software Setup
 

@@ -31,11 +31,8 @@ from hidagent.hidagent import (
 )
 
 
-# Scale factor: Claude sees the full-resolution image, but the calibration
-# was computed assuming a 2x downsized image. We scale Claude's coordinates
-# by 0.5 before calling click_mouse to convert them to the calibration's
-# coordinate space.
-_CLAUDE_COORD_SCALE = 0.5
+# Claude sees the full-resolution screenshot, and click_mouse() & co. take
+# screenshot pixels, so Claude's coordinates are used as they are.
 
 # Counter for debug images
 _click_counter = [0]
@@ -126,20 +123,6 @@ def _save_click_debug(x, y, label="click", before_img=None, after_img=None):
         # Print correction suggestion
         print(f"  [debug] Claude target: ({x},{y}), cursor landed: "
               f"({cursor_x},{cursor_y}), offset: ({dx:+d},{dy:+d})")
-        if x > 0 and y > 0:
-            # Current ratio implies cursor should land at (x, y)
-            # But it actually landed at (cursor_x, cursor_y).
-            # New ratio = current_ratio * (claude_coord / actual_pixel)
-            ratio_fix_x = x / cursor_x if cursor_x != 0 else 1.0
-            ratio_fix_y = y / cursor_y if cursor_y != 0 else 1.0
-            print(f"  [debug] Suggested ratio correction: "
-                  f"x *= {ratio_fix_x:.4f}, y *= {ratio_fix_y:.4f}")
-
-    # Also label the HID-space coordinate
-    scaled_x = int(x * _CLAUDE_COORD_SCALE)
-    scaled_y = int(y * _CLAUDE_COORD_SCALE)
-    cv2.putText(arr, f"sent HID-space: ({scaled_x},{scaled_y})",
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "imgs")
     os.makedirs(out_dir, exist_ok=True)
@@ -163,11 +146,6 @@ def probe_screenshot_size():
     return img.size  # (width, height)
 
 
-def _scale_claude_coord(x, y):
-    """Convert Claude's full-res coordinates to calibration space."""
-    return int(x * _CLAUDE_COORD_SCALE), int(y * _CLAUDE_COORD_SCALE)
-
-
 def run_tool(tool_name, tool_input):
     """Execute a tool action on the target device via HIDAgent."""
 
@@ -180,8 +158,7 @@ def run_tool(tool_name, tool_input):
     elif tool_name == "computer" and tool_input.get("action") == "left_click":
         x, y = tool_input["coordinate"]
         _save_click_debug(x, y, "left_click")
-        scaled_x, scaled_y = _scale_claude_coord(x, y)
-        click_mouse(scaled_x, scaled_y)
+        click_mouse(x, y)
         return [{"type": "text", "text": f"Clicked at ({x}, {y})"}]
 
     elif tool_name == "computer" and tool_input.get("action") == "key":
@@ -196,8 +173,7 @@ def run_tool(tool_name, tool_input):
 
     elif tool_name == "computer" and tool_input.get("action") == "mouse_move":
         x, y = tool_input["coordinate"]
-        scaled_x, scaled_y = _scale_claude_coord(x, y)
-        move_mouse(scaled_x, scaled_y)
+        move_mouse(x, y)
         return [{"type": "text", "text": f"Moved to ({x}, {y})"}]
 
     elif tool_name == "computer" and tool_input.get("action") == "wait":
@@ -212,11 +188,10 @@ def run_tool(tool_name, tool_input):
         coord = tool_input.get("coordinate", [200, 400])
         direction = tool_input.get("scroll_direction", "down")
         x, y = coord
-        scaled_x, scaled_y = _scale_claude_coord(x, y)
         if direction == "down":
-            drag_up(scaled_x, scaled_y)
+            drag_up(x, y)
         elif direction == "up":
-            drag_down(scaled_x, scaled_y)
+            drag_down(x, y)
         else:
             return [{"type": "text",
                      "text": f"Scroll direction {direction} not supported "

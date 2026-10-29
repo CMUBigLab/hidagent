@@ -53,9 +53,7 @@ def click_random_element(parsed_elements, image_size):
     px = int(x * width)
     py = int(y * height)
 
-    # click_mouse() expects calibration-space coordinates. Calibration was
-    # done at half-resolution (image_resize_factor=2), so scale down.
-    click_mouse(int(px * 0.5), int(py * 0.5))
+    click_mouse(px, py)
     print(f"  Clicked element at ({px}, {py}): {element.get('content', 'unknown')[:50]}")
     return True
 

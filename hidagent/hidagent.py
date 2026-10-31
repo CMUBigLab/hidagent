@@ -1380,13 +1380,40 @@ def _load_screen_rect(frame_shape):
         return None
 
 
-def _save_screen_rect(frame_shape, rect):
+_RECT_MATCH_PX = 12  # a fresh detection this close to a known rect is that device
+_RECT_MIN_LIT = 20   # lit pixels for a row/column to count (HDMI bleed beside
+                     # bright content lights only a few)
+
+
+def _rect_dist(a, b):
+    return max(abs(p - q) for p, q in zip(a, b))
+
+
+def _known_rects(frame_shape):
+    """Screen rects of devices seen before with this capture size."""
+    try:
+        with open(_SCREEN_RECT_FILE) as f:
+            return [tuple(r) for r in
+                    json.load(f).get(f"{frame_shape[1]}x{frame_shape[0]}/known", [])]
+    except (OSError, ValueError):
+        return []
+
+
+def _save_screen_rect(frame_shape, rect, replaces=None):
+    """Save rect as the current one and in the known-devices list, in place
+    of `replaces` (the same device's earlier rect) if given."""
     try:
         with open(_SCREEN_RECT_FILE) as f:
             saved = json.load(f)
     except (OSError, ValueError):
         saved = {}
-    saved[f"{frame_shape[1]}x{frame_shape[0]}"] = list(rect)
+    key = f"{frame_shape[1]}x{frame_shape[0]}"
+    saved[key] = list(rect)
+    known = [r for r in saved.get(key + "/known", [])
+             if replaces is None or tuple(r) != tuple(replaces)]
+    if list(rect) not in known:
+        known.append(list(rect))
+    saved[key + "/known"] = known
     with open(_SCREEN_RECT_FILE, "w") as f:
         json.dump(saved, f)
 
@@ -1401,7 +1428,10 @@ def get_screen_rect(refresh=False):
     true rect; it is therefore merged with the rect saved from earlier runs
     (screen_rect.json). Cached; check_device_change() discards the saved
     rect when the HID bridge is moved to another device. Pass refresh=True
-    to do the same yourself, e.g. after rotating the device.
+    to do the same yourself, e.g. after rotating the device. A refreshed
+    detection within _RECT_MATCH_PX of a device seen before reuses that
+    device's rect exactly, so its size (and its learned cursor model, which
+    is keyed by size) stays the same.
     """
     global _screen_rect, _rect_refresh_pending
     refresh = refresh or _rect_refresh_pending
@@ -1415,18 +1445,28 @@ def get_screen_rect(refresh=False):
         if not frames:
             raise ValueError('Failed to capture image from webcam')
         brightest = np.max(frames, axis=0)
-        ys, xs = np.where(brightest > 10)
-        if xs.size == 0:
+        lit = brightest > 10
+        xs = np.where(lit.sum(axis=0) >= _RECT_MIN_LIT)[0]
+        ys = np.where(lit.sum(axis=1) >= _RECT_MIN_LIT)[0]
+        if xs.size == 0 or ys.size == 0:
             h, w = brightest.shape
             return (0, 0, w, h)  # all dark (screen off?); don't cache
         rect = (int(xs.min()), int(ys.min()),
                 int(xs.max()) + 1, int(ys.max()) + 1)
-        saved = None if refresh else _load_screen_rect(brightest.shape)
-        if saved is not None:
-            rect = (min(rect[0], saved[0]), min(rect[1], saved[1]),
-                    max(rect[2], saved[2]), max(rect[3], saved[3]))
-        if rect != saved:
-            _save_screen_rect(brightest.shape, rect)
+        if refresh:
+            known = _known_rects(brightest.shape)
+            saved = min(known, key=lambda r: _rect_dist(r, rect), default=None)
+            if saved is not None and _rect_dist(saved, rect) <= _RECT_MATCH_PX:
+                rect = saved
+            else:
+                saved = None
+        else:
+            saved = _load_screen_rect(brightest.shape)
+            if saved is not None:
+                rect = (min(rect[0], saved[0]), min(rect[1], saved[1]),
+                        max(rect[2], saved[2]), max(rect[3], saved[3]))
+        if rect != saved or refresh:
+            _save_screen_rect(brightest.shape, rect, replaces=saved)
         _screen_rect = rect
         _rect_refresh_pending = False
     return _screen_rect

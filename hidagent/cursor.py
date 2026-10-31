@@ -26,7 +26,8 @@ import time
 import cv2
 import numpy as np
 
-from .hidagent import _get_usb_capture, get_screen_rect, send_serial_message
+from .hidagent import (_get_usb_capture, check_device_change, get_screen_rect,
+                       send_serial_message)
 
 _MAP_FILE = os.path.join(os.path.dirname(__file__), "cursor_map.json")
 
@@ -100,6 +101,14 @@ class CursorTracker:
         self.volatile = None    # 1 where pixels keep changing on their own
         self._vol_count = None
         self.scene_change = 0.0
+        # Click point relative to the detected center: (0, 0) for the iOS
+        # disc, the tip for an arrow pointer (Android). Set by
+        # init_background_nudge().
+        self.hotspot = np.zeros(2)
+        self._tips = []         # recent arrow-tip measurements
+        self._votes = {"arrow": 0, "round": 0}  # pointer shapes seen at init
+        self.init_gain = None   # px per unit seen by the last init nudge
+        self.init_from = None   # and where the pointer was before it
         d, r = _disc(radius), _ring(radius + 1.5, radius + 5)
         self._disc, self._ring = d / d.sum(), r / r.sum()
 
@@ -216,13 +225,17 @@ class CursorTracker:
         self.pos = (new[0], new[1])
         return self.pos
 
-    def init_background_nudge(self, toward=None, attempts=2):
+    def init_background_nudge(self, toward=None, attempts=2, gain=NUDGE_FAST[2],
+                              gain_known=False):
         """Like init_background(), but by nudging the pointer from wherever
         it is instead of sending it to the corner twice. Needs the nudge
         firmware. toward: optional (x, y) to nudge toward (e.g. the next
-        target), so the move also makes progress. Returns the new position,
-        or None if the pointer couldn't be seen moving (old firmware, or the
-        pointer is hidden)."""
+        target), so the move also makes progress. gain: expected px per unit
+        at NUDGE_FAST; the actual gain is measured (self.init_gain). Unless
+        gain_known, any plausible gain is accepted (new device), which a
+        highlight hopping between menu items under a hidden iOS pointer can
+        also pass. Returns the new position, or None if the pointer couldn't
+        be seen moving (old firmware, or the pointer is hidden)."""
         W, H = self.rect[2] - self.rect[0], self.rect[3] - self.rect[1]
         here = self.pos if self.pos is not None else (W / 2, H / 2)
         goal = toward if toward is not None else (W / 2, H / 2)
@@ -231,39 +244,120 @@ class CursorTracker:
             v = np.array([W / 2 - here[0] or 1.0, 0.0])
         v = v / np.hypot(*v)
         self.volatile = self._vol_count = None  # new scene
-        units = NUDGE_INIT_PX / NUDGE_FAST[2]
+        units = NUDGE_INIT_PX / gain
         for i in range(attempts):
             fa = self._learn_still(self.grab())
             n = np.round(v * units * (-1 if i % 2 else 1)).astype(int)
             hid_nudge(*n, speed=NUDGE_FAST)
             fb = self.grab()
             d = self._mask(self._diff(fa, fb))
-            pk = [p for p in self._peaks(self._score_map(d), k=4)
-                  if p[2] >= MIN_SCORE_NEAR]
-            if not pk or pk[0][2] < MIN_SCORE:
+            allpk = self._peaks(self._score_map(d), k=4)
+            pk = [p for p in allpk if p[2] >= MIN_SCORE_NEAR]
+            if not pk:
                 continue
             if self._large_change(d, pk[:2]) > SCENE_CHANGE_FRAC:
                 continue  # still animating
-            # The two spots are one nudge apart, which tells old from new on
-            # light and dark backgrounds alike. Only the stronger one has to
-            # pass MIN_SCORE: the pointer is faint over e.g. a tab bar.
-            shift = n * NUDGE_FAST[2]
-            tol = 4 + 0.3 * float(np.hypot(*shift))
-            near = lambda p, q: math.hypot(p[0] - q[0], p[1] - q[1]) <= tol
-            p1 = pk[0]
-            after = [q for q in pk[1:] if near(q, (p1[0] + shift[0], p1[1] + shift[1]))]
-            before = [q for q in pk[1:] if near(q, (p1[0] - shift[0], p1[1] - shift[1]))]
-            if after:
-                old, new = p1, after[0]
-            elif before:
-                old, new = before[0], p1
-            else:
+            # The two spots lie along the nudge, old one behind, which tells
+            # old from new on light and dark backgrounds alike and doesn't
+            # assume the gain (iOS ~0.4 px/unit, Android ~1). Only the
+            # stronger one has to pass MIN_SCORE: the pointer is faint over
+            # e.g. a tab bar. Over a dark background an arrow pointer scores
+            # below MIN_SCORE; a pair that stands far above everything else
+            # is accepted anyway.
+            un = n / np.hypot(*n)
+            lo, hi = (0.6 * gain, 1.6 * gain) if gain_known else (0.15, 4.0)
+            pair = None
+            for q in pk[1:]:
+                step = np.array(q[:2]) - pk[0][:2]
+                dist = float(np.hypot(*step))
+                if not lo <= dist / np.hypot(*n) <= hi:
+                    continue
+                cos = float(step @ un) / dist
+                if cos > 0.9:
+                    pair = (pk[0], q)
+                elif cos < -0.9:
+                    pair = (q, pk[0])
+                if pair:
+                    break
+            if pair is None:
                 continue
+            rest = [p[2] for p in allpk if p not in pair]
+            if pk[0][2] < MIN_SCORE and rest and \
+                    max(rest) * 3 > min(pair[0][2], pair[1][2]):
+                continue
+            old, new = pair
+            # Where the pointer was before this init (only if the first
+            # attempt worked; a failed one may have moved it).
+            self.init_from = (old[0], old[1]) if i == 0 else None
+            self.init_gain = math.hypot(new[0] - old[0], new[1] - old[1]) / np.hypot(*n)
+            self.hotspot = self._find_hotspot(fa, fb, new)
+            self._last_d = None
             self.bg = fb.copy()
             self._patch(self.bg, fa, new[0], new[1])
             self.pos = (new[0], new[1])
             return self.pos
         return None
+
+    def _pointer_blob(self, d, p):
+        """Mask of the pointer around p in a diff image, as (xs, ys) in d's
+        coordinates, or None."""
+        r = int(3 * self.radius)
+        H, W = d.shape[:2]
+        x0, y0 = max(0, int(p[0]) - r), max(0, int(p[1]) - r)
+        x1, y1 = min(W, int(p[0]) + r + 1), min(H, int(p[1]) + r + 1)
+        m = (d[y0:y1, x0:x1] > 30).astype(np.uint8)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        n, lab, _, _ = cv2.connectedComponentsWithStats(cv2.dilate(m, np.ones((3, 3), np.uint8)))
+        cx, cy = int(p[0]) - x0, int(p[1]) - y0
+        if n < 2 or not 0 <= cy < lab.shape[0] or not 0 <= cx < lab.shape[1] \
+                or lab[cy, cx] == 0:
+            return None
+        ys, xs = np.where((lab == lab[cy, cx]) & (m > 0))
+        return (xs + x0, ys + y0) if len(xs) else None
+
+    def current_hotspot(self):
+        """Hotspot for the pointer as last located. Android swaps the arrow
+        for an I-beam over text, whose hotspot is its center."""
+        if not self.hotspot.any() or self.pos is None or \
+                getattr(self, "_last_d", None) is None:
+            return self.hotspot
+        blob = self._pointer_blob(self._last_d, self.pos)
+        if blob is not None:
+            w = blob[0].max() - blob[0].min() + 1
+            h = blob[1].max() - blob[1].min() + 1
+            if h > 2.5 * w:
+                return np.zeros(2)
+        return self.hotspot
+
+    def _find_hotspot(self, before, after, p):
+        """Click point relative to the detected center p: the tip of an
+        arrow pointer, else the center. An arrow's topmost pixel is at the
+        left of its bounding box (a disc's is in the middle) and it fills
+        about half the box (a disc ~0.79, iOS's button highlight ~0.9).
+        Single measurements scatter by a few px with the background, so the
+        result is the median of recent ones. Some iOS shapes (a menu
+        highlight, the AssistiveTouch button) can pass for an arrow once, so
+        the tip is only used after 3+ arrow sightings that outnumber round
+        ones."""
+        blob = self._pointer_blob(self._diff(before, after), p)
+        if blob is None:
+            return self.hotspot
+        xs, ys = blob
+        bx, by = xs.min(), ys.min()
+        bw, bh = xs.max() - bx + 1, ys.max() - by + 1
+        tip = (xs[ys == by].min(), by)
+        fill = len(xs) / float(bw * bh)
+        if bh > 2.5 * bw:
+            return self.hotspot  # Android's I-beam: says nothing either way
+        if tip[0] - bx > 0.25 * bw or fill > 0.65:
+            self._votes["round"] += 1
+        else:
+            self._votes["arrow"] += 1
+            self._tips = (self._tips + [(tip[0] - p[0], tip[1] - p[1])])[-9:]
+        v = self._votes
+        if v["arrow"] >= 3 and v["arrow"] > v["round"]:
+            return np.median(np.array(self._tips, float), axis=0)
+        return np.zeros(2)
 
     def locate(self, expected=None, search_radius=60):
         """Find the cursor in a newly settled frame.
@@ -277,13 +371,18 @@ class CursorTracker:
         frame = self.grab()
         d_raw = self._diff(self.bg, frame)
         d = self._mask(d_raw)
+        self._last_d = d
         pk = self._peaks(self._score_map(d))
+        strong = MIN_SCORE
+        if pk and pk[0][2] >= MIN_SCORE_NEAR and (len(pk) < 2 or pk[0][2] >= 3 * pk[1][2]):
+            # A lone clear peak, e.g. an arrow pointer on a dark background.
+            strong = min(strong, pk[0][2])
         if expected is None:
-            pk = [p for p in pk if p[2] >= MIN_SCORE]
+            pk = [p for p in pk if p[2] >= strong]
         else:
             dist = lambda p: math.hypot(p[0] - expected[0], p[1] - expected[1])
             pk = sorted((p for p in pk if dist(p) <= search_radius and (
-                p[2] >= MIN_SCORE or (p[2] >= MIN_SCORE_NEAR and dist(p) <= NEAR_RADIUS))),
+                p[2] >= strong or (p[2] >= MIN_SCORE_NEAR and dist(p) <= NEAR_RADIUS))),
                 key=dist)
         self.last_peaks = pk
         found = pk[0][:2] if pk else None
@@ -327,7 +426,15 @@ class CursorTracker:
         changed = cv2.dilate(changed, np.ones((5, 5), np.uint8))
         _, _, stats, _ = cv2.connectedComponentsWithStats(changed)
         big = 6 * math.pi * self.radius ** 2
-        return sum(int(s[4]) for s in stats[1:] if s[4] > big) / float(H * W)
+        pts = [p for p in keep_out if p is not None]
+
+        def hover(s):
+            # A control highlighting under the pointer (Android hover
+            # states) surrounds the pointer; that's not a new screen.
+            return any(s[0] <= p[0] < s[0] + s[2] and s[1] <= p[1] < s[1] + s[3]
+                       for p in pts)
+        return sum(int(s[4]) for s in stats[1:]
+                   if s[4] > big and not hover(s)) / float(H * W)
 
 
 class CursorPositioner:
@@ -342,13 +449,45 @@ class CursorPositioner:
         # older firmware silently ignores it) and its px per HID unit.
         self.nudge_ok = None
         self.nudge_gain = {s: np.array([s[2]] * 2) for s in (NUDGE_FINE, NUDGE_FAST)}
+        self._gain_seeded = False
+        if self._saved_gain is not None:
+            self._seed_gain(self._saved_gain)
+
+    def _seed_gain(self, g):
+        """Replace the iOS default gains with a measured FAST gain."""
+        self._gain_seeded = True
+        self.nudge_gain[NUDGE_FAST][:] = g
+        # FINE is slower, so iOS accelerates it less. Assuming the same ratio
+        # elsewhere at worst undershoots, which the nudge loop corrects.
+        self.nudge_gain[NUDGE_FINE][:] = g * NUDGE_FINE[2] / NUDGE_FAST[2]
+
+    def _init_nudge(self, toward):
+        """init_background_nudge(), and on the first success replace the
+        iOS default gains with the one it measured (Android's is ~2.5x)."""
+        pos = self.t.init_background_nudge(
+            toward=toward, gain=float(self.nudge_gain[NUDGE_FAST].mean()),
+            gain_known=self._gain_seeded)
+        g = self.t.init_gain
+        if pos is not None and g is not None and not self._gain_seeded:
+            self._seed_gain(g)
+        return pos
 
     # ---------------------------------------------------------- persistence
     def _load(self):
+        self._saved_gain = None
         if not os.path.exists(_MAP_FILE):
             return []
         with open(_MAP_FILE) as f:
-            return [tuple(o) for o in json.load(f).get(self._key, [])]
+            data = json.load(f)
+        self._saved_gain = data.get(self._key + "/gain")
+        # The arrow-tip offset is hard to measure on dark screens, so keep
+        # the one measured earlier on this device.
+        hs = data.get(self._key + "/hotspot")
+        if hs is not None:
+            self.t.hotspot = np.array(hs, float)
+            self.t._tips = [tuple(hs)] * 3
+            self.t._votes["arrow"] = 3
+        return [tuple(o) for o in data.get(self._key, [])]
 
     def save(self, max_obs=2000):
         data = {}
@@ -356,6 +495,12 @@ class CursorPositioner:
             with open(_MAP_FILE) as f:
                 data = json.load(f)
         data[self._key] = [list(o) for o in self.obs[-max_obs:]]
+        if self.t.hotspot.any():
+            data[self._key + "/hotspot"] = [float(v) for v in self.t.hotspot]
+        else:
+            data.pop(self._key + "/hotspot", None)
+        if self._gain_seeded:
+            data[self._key + "/gain"] = float(self.nudge_gain[NUDGE_FAST].mean())
         with open(_MAP_FILE, "w") as f:
             json.dump(data, f)
 
@@ -480,9 +625,13 @@ class CursorPositioner:
             result = self._goto_nudge(np.array([tx, ty], float), tol, max_iter)
             if result is not None:
                 return result
-        result = self._goto_absolute(tx, ty, tol, max_iter)
+        # Absolute moves steer the detected center; aim it so the hotspot
+        # (an arrow's tip) lands on the target.
+        hs = self.t.hotspot
+        result = self._goto_absolute(*self.aim(tx, ty), tol, max_iter)
         if result is not None:
             result["nudged"] = False
+            result["pos"] = (result["pos"][0] + hs[0], result["pos"][1] + hs[1])
         return result
 
     def command_for(self, tx, ty, tol=1.0, max_err=5.0):
@@ -495,20 +644,35 @@ class CursorPositioner:
         """
         W, H = self.t.rect[2] - self.t.rect[0], self.t.rect[3] - self.t.rect[1]
         if min(tx, ty, W - tx, H - ty) > 10:
-            r = self._goto_absolute(tx, ty, tol)
+            r = self._goto_absolute(*self.aim(tx, ty), tol)
             if r is not None and r["err"] <= max_err:
                 return r["cmd"]
-        return tuple(int(c) for c in np.round(self.predict_cmd((tx, ty))))
+        return tuple(int(c) for c in np.round(self.predict_cmd(self.aim(tx, ty))))
+
+    def mapped(self, tx, ty):
+        """Whether there are landings to predict commands near (tx, ty)."""
+        return self._fit((tx, ty), "pos") is not None
+
+    def aim(self, tx, ty):
+        """Where the detected center must go for the hotspot to hit (tx, ty);
+        absolute commands and the learned map work in centers."""
+        return (tx - self.t.hotspot[0], ty - self.t.hotspot[1])
 
     def _goto_nudge(self, target, tol, max_iter):
         """goto() via nudges; None if nudging isn't possible here."""
         t = self.t
         it = 0
         pos = None
-        near = t.pos is not None and math.hypot(*(target - t.pos)) <= NUDGE_MAX_PX
+        # Until there are landings to fit, an absolute move is a guess at
+        # the scale (iOS's on a new device) and can bury the pointer in a
+        # corner; nudge the whole way instead.
+        mapped = self.mapped(*target)
+        near = t.pos is not None and (
+            not mapped or math.hypot(*(target - t.pos)) <= NUDGE_MAX_PX)
         if t.bg is not None and near:
             # Also notices if the screen changed since (then t.bg is None).
             pos = t.locate(expected=t.pos, search_radius=15)
+        cmd = None
         if pos is None and not near:
             # One absolute move to a spot a nudge away from the target (on
             # the screen-center side). If the screen changed, the nudge onto
@@ -517,6 +681,11 @@ class CursorPositioner:
             v = np.array([W / 2, H / 2]) - target
             v = v / np.hypot(*v) if np.hypot(*v) > 1 else np.array([1.0, 0])
             start = target + v * NUDGE_INIT_PX
+            if not mapped:
+                # New device, scale unknown: aim well short so the pointer
+                # stays on screen (short means toward the top-left corner,
+                # where an arrow pointer is still visible).
+                start = target * 0.6
             it += 1
             cmd = tuple(int(c) for c in np.round(self.predict_cmd(start)))
             hid_move(*cmd)
@@ -525,14 +694,27 @@ class CursorPositioner:
                 pos = self._locate_after(cmd)
                 if pos is not None:
                     self.obs.append((*cmd, float(pos[0]), float(pos[1])))
-        if pos is None and t.bg is not None:
-            return None  # pointer not visible here; let the caller fall back
         if pos is None:
-            pos = t.init_background_nudge(toward=target)
+            # Lost (the absolute move went somewhere unexpected, e.g. on a
+            # new device before the map has landings) or the screen changed:
+            # find the pointer by nudging it from wherever it is.
+            lost = t.bg is not None
+            pos = self._init_nudge(target)
+            if pos is not None and cmd is not None and t.init_from is not None:
+                # The init nudge saw where the absolute move had landed.
+                self.obs.append((*cmd, *map(float, t.init_from)))
+            if pos is None and lost:
+                # Possibly against an edge or in a corner, where an arrow
+                # pointer is mostly off screen: bring it to the middle.
+                W, H = t.rect[2] - t.rect[0], t.rect[3] - t.rect[1]
+                hid_move(*np.round(self.predict_cmd((W / 2, H / 2))).astype(int))
+                t.pos = (W / 2, H / 2)
+                it += 1
+                pos = self._init_nudge(target)
             if pos is None:
                 # Couldn't see the pointer move. That's either old firmware
                 # (no nudge) or a hidden pointer; only the first is permanent.
-                if self.nudge_ok is None:
+                if self.nudge_ok is None and not lost:
                     self._nudge_fails = getattr(self, "_nudge_fails", 0) + 1
                     if self._nudge_fails >= 2:
                         self.nudge_ok = False
@@ -540,7 +722,8 @@ class CursorPositioner:
             self.nudge_ok = True
         best_err, stalls, verified = None, 0, True
         while True:
-            err = target - np.array(pos)
+            hs = t.current_hotspot() if verified else t.hotspot
+            err = target - np.array(pos) - hs
             dist = float(np.hypot(*err))
             if best_err is None or dist < best_err - 0.2:
                 stalls = 0
@@ -561,7 +744,7 @@ class CursorPositioner:
             new = t.locate(expected=exp, search_radius=12 + 0.25 * hop)
             if new is None:
                 if t.bg is None:  # scene changed: start over from here
-                    return None if t.init_background_nudge(toward=target) is None \
+                    return None if self._init_nudge(target) is None \
                         else self._goto_nudge(target, tol, max_iter - it)
                 # Invisible here (e.g. over a black icon): nudges are
                 # near-linear over short hops, so estimate where it went.
@@ -581,8 +764,9 @@ class CursorPositioner:
             pos = new
         self.save()
         # The pointer stays where it last landed, so report that landing.
+        pos = np.array(pos) + hs
         return {"cmd": None, "pos": tuple(float(v) for v in pos),
-                "err": float(np.hypot(*(target - np.array(pos)))),
+                "err": float(np.hypot(*(target - pos))),
                 "verified": verified, "iters": it, "snapped": False,
                 "nudged": True}
 
@@ -690,8 +874,9 @@ _positioner = None
 
 
 def get_positioner():
-    """Shared CursorPositioner (one per process)."""
+    """Shared CursorPositioner, rebuilt when the target device changes."""
     global _positioner
+    check_device_change()
     if _positioner is None:
         _positioner = CursorPositioner()
     return _positioner

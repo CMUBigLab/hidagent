@@ -248,6 +248,7 @@ def get_screenshot():
     Identifies the connected USB capture device, captures one frame,
     and returns it as a PIL Image object.
     """
+    check_device_change()
     return get_image_from_usb()
 
 
@@ -284,7 +285,12 @@ def click_mouse(x, y, button="left", tol=1.0, max_err=5.0):
     p = get_positioner()
     result = p.goto(x, y, tol=tol)
     if result is None:
-        cmd = tuple(int(round(c)) for c in p.predict_cmd((x, y)))
+        if not p.mapped(x, y):
+            print(f"click_mouse: pointer not found and no learned landings "
+                  f"near ({x}, {y}); not clicking")
+            return {"cmd": None, "pos": None, "err": None, "verified": False,
+                    "clicked": False, "blind": False}
+        cmd = tuple(int(round(c)) for c in p.predict_cmd(p.aim(x, y)))
         print(f"click_mouse: pointer not visible near ({x}, {y}); "
               f"clicking from the learned map")
         hid_click(*cmd)
@@ -986,7 +992,7 @@ def release_serial_conn():
         _serial_conn = None
 
 
-def send_serial_message(message, wait_response=True):
+def send_serial_message(message, wait_response=True, quiet=False):
     """Send a command to the HID bridge and wait for it to finish.
 
     The bridge replies "Success" (or "Error") once the command has been
@@ -994,8 +1000,10 @@ def send_serial_message(message, wait_response=True):
     means a screenshot taken afterwards shows the finished result. Pass
     wait_response=False only when the caller doesn't care about either;
     unread replies are discarded before the next command is sent.
+    quiet=True skips the progress prints (for frequent status checks).
     """
-    print(f"Sending message: {message.strip()}")
+    if not quiet:
+        print(f"Sending message: {message.strip()}")
 
     with _serial_lock:
         ser = _get_serial_conn()
@@ -1004,14 +1012,16 @@ def send_serial_message(message, wait_response=True):
             ser.reset_input_buffer()
             ser.write(message.encode('utf-8'))
             ser.flush()
-            print(f"Sent: {message.strip()}")
+            if not quiet:
+                print(f"Sent: {message.strip()}")
 
             if wait_response:
                 # errors="replace": a corrupted byte on the UART line
                 # shouldn't crash the caller.
                 response = ser.readline().decode('utf-8', errors='replace').strip()
                 if response:
-                    print(f"Received: {response}")
+                    if not quiet:
+                        print(f"Received: {response}")
                 else:
                     print(f"Warning: no reply from HID bridge within "
                           f"{_SERIAL_RESPONSE_TIMEOUT}s")
@@ -1019,6 +1029,77 @@ def send_serial_message(message, wait_response=True):
 
         except KeyboardInterrupt:
             pass
+
+
+_BRIDGE_STATE_FILE = os.path.join(os.path.dirname(__file__), "bridge_state.json")
+_DEVICE_CHECK_INTERVAL = 2.0  # s; swapping devices by hand takes longer
+_bridge_token = None          # [boot_id, host_count] last seen
+_device_checked = 0.0
+
+
+def bridge_status():
+    """Ask the HID bridge about its USB host.
+
+    Returns (boot_id, host_count, connected). boot_id changes whenever the
+    Pico restarts and host_count goes up each time a host connects, so a
+    change in either means the target device may have been swapped. Returns
+    None if the bridge doesn't answer or its firmware predates "status"
+    (which answers "Success").
+    """
+    try:
+        r = send_serial_message('{"type": "status"}\n', quiet=True)
+    except OSError:
+        return None
+    parts = (r or "").split()
+    if len(parts) != 4 or parts[0] != "Status":
+        return None
+    return parts[1], int(parts[2]), parts[3] == "1"
+
+
+def _load_bridge_token():
+    try:
+        with open(_BRIDGE_STATE_FILE) as f:
+            return json.load(f)["token"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def check_device_change(force=False):
+    """Forget device-specific state if the target device may have changed.
+
+    Compares bridge_status() with the last one seen, including in earlier
+    runs (bridge_state.json). On a change, the screen rect is detected
+    afresh instead of merged with the saved one, and the cursor model is
+    reloaded for the new screen size. A Pico restart on the same device
+    looks the same; that only costs a re-detection. Checks at most every
+    _DEVICE_CHECK_INTERVAL s unless force. Returns True on a change.
+    """
+    global _bridge_token, _device_checked, _screen_rect, _rect_refresh_pending
+    now = time.time()
+    if not force and now - _device_checked < _DEVICE_CHECK_INTERVAL:
+        return False
+    _device_checked = now
+    status = bridge_status()
+    if status is None or not status[2]:
+        return False  # old firmware, no answer, or mid-swap: check later
+    token = [status[0], status[1]]
+    if _bridge_token is None:
+        _bridge_token = _load_bridge_token()
+    if token == _bridge_token:
+        return False
+    first = _bridge_token is None
+    _bridge_token = token
+    with open(_BRIDGE_STATE_FILE, "w") as f:
+        json.dump({"token": token}, f)
+    if first:
+        return False  # nothing to compare with yet
+    print("HID bridge reconnected (device may have changed); "
+          "re-detecting the screen")
+    _screen_rect = None
+    _rect_refresh_pending = True
+    from . import cursor
+    cursor._positioner = None
+    return True
 
 
 def convert_to_html(image, omni_parser):
@@ -1285,6 +1366,9 @@ def release_usb_capture():
 
 
 _screen_rect = None  # (x0, y0, x1, y1) of the device's screen in the frame
+# Set after a device swap: the next detection mustn't merge with the saved
+# rect (the old device's). Stays set until a detection succeeds.
+_rect_refresh_pending = False
 _SCREEN_RECT_FILE = os.path.join(os.path.dirname(__file__), "screen_rect.json")
 
 
@@ -1315,10 +1399,12 @@ def get_screen_rect(refresh=False):
     A dark app (black background reaching the screen edges) is
     indistinguishable from the letterbox, so detection can only shrink the
     true rect; it is therefore merged with the rect saved from earlier runs
-    (screen_rect.json). Cached; pass refresh=True after switching devices
-    or orientation to discard the saved rect.
+    (screen_rect.json). Cached; check_device_change() discards the saved
+    rect when the HID bridge is moved to another device. Pass refresh=True
+    to do the same yourself, e.g. after rotating the device.
     """
-    global _screen_rect
+    global _screen_rect, _rect_refresh_pending
+    refresh = refresh or _rect_refresh_pending
     if _screen_rect is None or refresh:
         cap = _get_usb_capture()
         frames = []
@@ -1342,6 +1428,7 @@ def get_screen_rect(refresh=False):
         if rect != saved:
             _save_screen_rect(brightest.shape, rect)
         _screen_rect = rect
+        _rect_refresh_pending = False
     return _screen_rect
 
 

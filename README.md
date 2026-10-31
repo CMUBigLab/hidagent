@@ -38,6 +38,12 @@ Copy [circuitpython/code.py](circuitpython/code.py) to `CIRCUITPY/code.py`.
 The Pico will auto-reload and start running it. The Pico is now ready to
 act as a USB HID device.
 
+Also copy [circuitpython/safemode.py](circuitpython/safemode.py) to
+`CIRCUITPY/safemode.py`. Some phones (e.g. Android) cut or dip USB power
+when they sleep; this reboots the Pico after a brownout instead of leaving
+it in safe mode. The bridge itself waits for the phone to accept it and
+replies `Error` to commands sent while the phone is asleep.
+
 ### Step 4: Wire the UART
 
 Connect a USB-to-serial adapter to the Pico:
@@ -47,6 +53,12 @@ Connect a USB-to-serial adapter to the Pico:
 | TX      | GP1 (UART0 RX) |
 | RX      | GP0 (UART0 TX) |
 | GND     | GND           |
+| 5V (optional) | VSYS (pin 39) |
+
+The optional 5V wire powers the Pico from the adapter, so it keeps running
+when a phone cuts USB power while asleep (common on Android). Use VSYS, not
+VBUS (pin 40, which would feed power back into the phone) or 3V3. Connect
+it with everything unplugged; connecting wires live can glitch the board.
 
 The serial adapter should plug into your control computer's USB port and
 appear as `/dev/tty.usbserial-*` (macOS/Linux) or a `COM` port (Windows).
@@ -74,9 +86,17 @@ calibration step, and a new device works right away. Where the pointer
 lands is remembered in `hidagent/cursor_map.json` (per screen size) so
 later moves start close; deleting it only makes the first moves a little
 slower. The screen's position in the capture frame is saved in
-`hidagent/screen_rect.json`; if you change devices or orientation, delete it
-or call `get_screen_rect(refresh=True)` once while the screen shows
-something bright out to its edges (e.g. the home screen).
+`hidagent/screen_rect.json`.
+
+Moving the Pico to another device is detected automatically: the bridge
+counts USB connections and picks a new ID each time it restarts, and
+HIDAgent checks these before screenshots and pointer moves. On a change it
+re-detects the screen's position and loads what it learned for that screen
+size. Re-detection works best when the screen shows something bright out to
+its edges (e.g. the home screen). After rotating a device, call
+`get_screen_rect(refresh=True)` yourself. Wiring the Pico's power from the
+serial adapter (5V to VSYS) keeps it running between devices; without it the
+Pico restarts on each plug-in, which is detected the same way.
 
 On iPhone, iOS hides the pointer in a few places (e.g. the AssistiveTouch
 menu). `click_mouse` then clicks from what it has learned and marks the

@@ -13,6 +13,7 @@ __pycache__/
 hidagent/calibration.json
 hidagent/cursor_map.json
 hidagent/screen_rect.json
+hidagent/bridge_state.json
 
 # Generated output from examples
 examples/dataset/

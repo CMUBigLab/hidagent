@@ -3,6 +3,8 @@ import board
 import usb_hid
 import busio
 import json
+import os
+import supervisor
 
 from adafruit_hid.keyboard import Keyboard
 from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS
@@ -18,16 +20,36 @@ uart = busio.UART(board.GP0, board.GP1, baudrate=9600,
 
 buffer = bytearray()
 
+# Reported by the "status" command so the control computer can tell when the
+# target device may have changed: boot_id changes when the Pico restarts, and
+# host_count goes up each time a USB host (phone, computer) connects.
+boot_id = os.urandom(4).hex()
+host_count = 0
+host_connected = False
+
+def poll_host():
+    global host_count, host_connected
+    connected = supervisor.runtime.usb_connected
+    if connected and not host_connected:
+        host_count += 1
+    host_connected = connected
+
 def read_uart_line():
     global buffer
     while True:
+        poll_host()
         data = uart.read(32)
         if data:
             buffer.extend(data)
             if b'\n' in buffer:
                 line, _, remainder = buffer.partition(b'\n')
                 buffer = bytearray(remainder)
-                return line.decode("utf-8").strip()
+                # Line noise (e.g. wires moved while powered) can arrive
+                # as invalid UTF-8; treat it as a bad command, not a crash.
+                try:
+                    return line.decode("utf-8").strip()
+                except UnicodeError:
+                    return ""
         time.sleep(0.01)
 
 def try_parse_json(line):
@@ -37,24 +59,39 @@ def try_parse_json(line):
         print("JSON parse error:", e)
         return None
 
-# Initialize HID devices
-time.sleep(1)
-keyboard = Keyboard(usb_hid.devices)
-keyboard_layout = KeyboardLayoutUS(keyboard)
-mouse = Mouse(usb_hid.devices)
-time.sleep(1)
+keyboard = keyboard_layout = mouse = None
+
+def init_hid():
+    # Keyboard()/Mouse() raise OSError until the host has enumerated the
+    # Pico, e.g. while an Android phone is asleep or locked. Return False
+    # instead of crashing so the UART loop keeps running.
+    # With no host at all, Keyboard()/Mouse() wait for one forever by
+    # default, which would stop the bridge answering, so check first and
+    # pass a timeout.
+    global keyboard, keyboard_layout, mouse
+    if not supervisor.runtime.usb_connected:
+        mouse = None
+        return False
+    try:
+        keyboard = Keyboard(usb_hid.devices, timeout=1)
+        keyboard_layout = KeyboardLayoutUS(keyboard)
+        mouse = Mouse(usb_hid.devices, timeout=1)
+        return True
+    except OSError as e:
+        print("HID not ready:", e)
+        mouse = None
+        return False
+
+# Wait for the host to accept the HID devices, but not forever: commands
+# retry init_hid() themselves.
+for _ in range(10):
+    time.sleep(1)
+    if init_hid():
+        break
 
 print("HIDAgent ready")
 
-while True:
-    line = read_uart_line()
-    print("Received:", line)
-
-    command_json = try_parse_json(line)
-    if command_json is None:
-        uart.write("Error\n".encode("utf-8"))
-        continue
-
+def handle(command_json):
     type_param = command_json.get("type", "")
     x_param = command_json.get("x", 0)
     y_param = command_json.get("y", 0)
@@ -145,5 +182,41 @@ while True:
             time.sleep(0.05)
             mouse.move(y=step)
         mouse.release(Mouse.LEFT_BUTTON)
+
+
+while True:
+    line = read_uart_line()
+    print("Received:", line)
+
+    command_json = try_parse_json(line)
+    if command_json is None:
+        uart.write("Error\n".encode("utf-8"))
+        continue
+
+    # Doesn't need HID, so it answers even with no host attached.
+    if isinstance(command_json, dict) and command_json.get("type") == "status":
+        poll_host()
+        uart.write("Status {} {} {}\n".format(
+            boot_id, host_count, int(host_connected)).encode("utf-8"))
+        continue
+
+    # A sleeping or unplugged host makes HID sends raise OSError; reply
+    # Error and set the devices up again on the next command.
+    if mouse is None and not init_hid():
+        uart.write("Error\n".encode("utf-8"))
+        continue
+    try:
+        handle(command_json)
+    except OSError as e:
+        print("HID error:", e)
+        mouse = None
+        uart.write("Error\n".encode("utf-8"))
+        continue
+    except Exception as e:
+        # A malformed command (e.g. text the layout can't type) must not
+        # stop the bridge; it would go silent until power-cycled.
+        print("Command error:", e)
+        uart.write("Error\n".encode("utf-8"))
+        continue
 
     uart.write("Success\n".encode("utf-8"))
